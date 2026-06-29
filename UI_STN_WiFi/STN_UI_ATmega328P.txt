@@ -1,0 +1,5868 @@
+/*
+
+  MCU:
+    ATmega328P / ATmega168 compatible
+
+  Purpose:
+    - Send/receive bidirectional heartbeat with Power Controller every 1 second
+    - Request Power Controller version
+    - Display Power Controller version for 2 seconds
+    - Display UI version for 2 seconds
+    - Display OFF
+
+  Startup sequence:
+    PC version 1.9 -> UI version 1.8 -> OFF
+*/
+
+#include <Arduino.h>
+#include <ICSC.h>
+#include <EEPROM.h>
+
+// ======================================================
+// ICSC SETTINGS
+// ======================================================
+
+#define UI_ADDRESS 1
+#define POWER_CONTROLLER_ADDRESS 2
+#define ICSC_BAUD 57600UL
+
+#define RS485_TXEN_PIN 6  // PD6 / TXEN
+
+#define CMD_HEARTBEAT 'H'
+#define CMD_HEARTBEAT_ACK 'h'
+
+#define CMD_VERSION_REQUEST 'V'
+#define CMD_VERSION_REPLY 'v'
+
+#define CMD_POWER_ON 'P'      // UI -> Power Controller
+#define CMD_POWER_ON_ACK 'p'  // Power Controller -> UI
+#define CMD_POWER_OFF 'X'     // UI -> Power Controller
+
+#define CMD_CABIN_LIGHT_SETPOINT 'C'  // UI -> Power Controller
+#define CMD_CABIN_LIGHT_STATUS 'c'    // Power Controller -> UI
+
+#define CMD_ERROR_REPORT 'E'  // Power Controller -> UI
+#define CMD_SLAVE_STATUS_REQUEST 'Z'  // UI -> Master PC: service status request
+#define CMD_SLAVE_STATUS_REPLY 'z'    // Master PC -> UI: service status reply
+#define CMD_SLAVE_SERVICE_SET 'O'     // UI -> Master PC: set selected slave OK/OF
+#define CMD_SLAVE_SERVICE_ACK 'o'     // Master PC -> UI: service set acknowledgement
+
+#define CMD_DIP_REQUEST 'D'  // UI -> Power Controller
+#define CMD_DIP_REPLY 'd'    // Power Controller -> UI
+
+#define CMD_UI_SETTINGS 'U'         // UI -> Power Controller: target temp + session time + standby time
+#define CMD_UI_SETTINGS_ACK 'u'     // Power Controller -> UI
+#define CMD_SET_OPERATION_MODE 'M'  // UI -> Power Controller: 0=Session, 1=Standby
+#define CMD_DRAIN_FILL_START 'A'    // UI -> Power Controller: start force drain
+#define CMD_DRAIN_FILL_STOP 'a'     // UI -> Power Controller: stop drain
+
+#define CMD_SCENT_PUMP_SETPOINT 'N'  // UI -> Power Controller
+#define CMD_SCENT_PUMP_STATUS 'n'    // Power Controller -> UI
+
+#define CMD_FAN_CONTROL 'F'  // UI -> Power Controller
+#define CMD_FAN_STATUS 'f'   // Power Controller -> UI
+
+#define HEARTBEAT_INTERVAL_MS 1000UL
+#define VERSION_REQUEST_INTERVAL_MS 1000UL
+#define VERSION_REPLY_TIMEOUT_MS 5000UL
+#define VERSION_DISPLAY_TIME_MS 1000UL
+#define DIP_REQUEST_INTERVAL_MS 2000UL
+
+// ======================================================
+// UI VERSION
+// ======================================================
+
+#define UI_VERSION_MAJOR 1
+#define UI_VERSION_MINOR 8
+
+// ======================================================
+// EEPROM SETTINGS
+// ======================================================
+
+#define EEPROM_MAGIC_VALUE 0xA5
+#define EEPROM_SETTINGS_VERSION 1
+
+#define EEPROM_ADDR_MAGIC 0
+#define EEPROM_ADDR_VERSION 1
+#define EEPROM_ADDR_TARGET_TEMP 2
+#define EEPROM_ADDR_SESSION_LOW 3
+#define EEPROM_ADDR_SESSION_HIGH 4
+#define EEPROM_ADDR_STANDBY_LOW 5
+#define EEPROM_ADDR_STANDBY_HIGH 6
+#define EEPROM_ADDR_SCENT_SETPOINT 7
+#define EEPROM_ADDR_CABIN_LIGHT_PERCENT 8
+#define EEPROM_ADDR_CHECKSUM 9
+
+// ======================================================
+// DISPLAY / UI PIN DEFINITIONS
+// ======================================================
+
+
+#define S1_ON_OFF_PIN 2       // PD2 / S1 On/Off button
+#define S2_CABIN_LIGHT_PIN 3  // PD3 / S2 Cabin Light button
+#define S4_STANDBY_PIN 9      // PB1 / S4 / Segment B / Standby button
+#define S3_ADC_PIN A6         // ADC6 / SW3 / Fan + Scent Pump
+#define S3_PRESSED_ADC_MAX 300
+#define S3_HOLD_MS 3000UL
+#define S5_DOWN_PIN 8        // PB0 / S5 / Segment A
+#define S6_TEMP_TIME_PIN 10  // PB2 / S6 / Segment C
+#define S7_UP_PIN 11         // PB3 / S7 / Segment D
+#define BUZZER_PIN 5         // PD5 / T1 / Buzzer
+
+#define SEG_A_PIN 8    // PB0 / A
+#define SEG_B_PIN 9    // PB1 / B
+#define SEG_C_PIN 10   // PB2 / C
+#define SEG_D_PIN 11   // PB3 / D
+#define SEG_E_PIN 12   // PB4 / E
+#define SEG_F_PIN 13   // PB5 / F
+#define SEG_G_PIN A0   // PC0 / G
+#define SEG_DP_PIN A1  // PC1 / DP
+
+#define COL1_PIN A2  // PC2 / COL1
+#define COL2_PIN A3  // PC3 / COL2
+#define COL3_PIN A4  // PC4 / COL3
+#define COL4_PIN A5  // PC5 / COL4
+#define COL5_PIN 4   // PD4 / indicator LED column
+
+#define SEGMENT_ACTIVE_LOW 1
+#define COLUMN_ACTIVE_LOW 1
+
+#define DISPLAY_REFRESH_US 1000UL
+#define DISPLAY_TIMER1_REFRESH_US 1000UL
+#define SHARED_BUTTON_SCAN_INTERVAL_MS 20UL
+
+#define SCENT_PUMP_MIN_SETPOINT 1
+#define SCENT_PUMP_MAX_SETPOINT 20
+#define SCENT_PUMP_ADJUST_TIMEOUT_MS 5000UL
+
+#define BUTTON_DEBOUNCE_MS 40UL
+#define POWER_COMMAND_REPEAT_MS 1000UL
+#define TEMP_BLINK_DURATION_MS 5000UL
+#define TEMP_BLINK_INTERVAL_MS 500UL
+
+#define SETTINGS_ENTER_HOLD_MS 3000UL
+#define SETTINGS_SAVE_HOLD_MS 5000UL
+#define STANDBY_S6_SAVE_HOLD_MS 3000UL
+#define S4_DRAIN_HOLD_MS 3000UL
+
+/*
+  New 5-button UI timing:
+    S4 hold 2 sec in Session/Menu mode = save selected feature values.
+    S4 hold 5 sec in Standby mode      = force drain.
+    S6 hold 2 sec in ON/Standby mode   = OFF state.
+*/
+#define S4_MENU_SAVE_HOLD_MS 2000UL
+#define S4_FORCE_DRAIN_HOLD_MS 5000UL
+#define S6_POWER_OFF_HOLD_MS 2000UL
+
+#define SETTINGS_TIMEOUT_MS 5000UL
+#define BUTTON_FAST_REPEAT_START_MS 600UL
+#define BUTTON_FAST_REPEAT_INTERVAL_MS 150UL
+#define S6_SHARED_BUTTON_GUARD_MS 250UL
+#define STANDBY_FLASH_TOTAL_MS 30000UL
+#define STANDBY_FLASH_INTERVAL_MS 1000UL
+#define DRAIN_DISPLAY_INTERVAL_MS 1000UL
+#define TARGET_TEMP_MIN_C 30
+#define CABIN_LIGHT_DEFAULT_PERCENT 100
+#define TARGET_TEMP_DEFAULT_C 40
+#define SESSION_TIME_STEP_MIN 5
+#define SESSION_TIME_MIN_MIN 5
+#define SESSION_TIME_24H_MIN 1440U
+#define SESSION_TIME_UNLIMITED 0xFFFFU
+
+#define HEARTBEAT_ACK_TIMEOUT_MS 10000UL
+#define ERROR_BLINK_INTERVAL_MS 500UL
+#define SLAVE_ERROR_DISPLAY_INTERVAL_MS 1000UL
+#define SERVICE_MODE_ENTRY_HOLD_MS 3000UL
+#define SERVICE_MODE_SAVE_HOLD_MS 3000UL
+#define SERVICE_STATUS_REQUEST_INTERVAL_MS 1000UL
+#define MAX_GENERATOR_SLAVES 7
+
+// Indicator LEDs using COL5 + segment lines
+#define LED_CABIN_LIGHT 0x01  // D4
+#define LED_ON 0x02           // D5
+#define LED_STANDBY 0x04      // D7
+#define LED_FAN 0x08          // D9
+#define LED_TEMP 0x10         // D10
+#define LED_SCENT 0x20        // D8
+#define LED_SESSION 0x40      // D6
+
+// ======================================================
+// FORWARD DECLARATIONS - added for Arduino/MiniCore compile stability
+// ======================================================
+
+void updateStandbyModeDisplay();
+void startStandbyIntroFlash();
+void stopStandbyIntroFlash();
+void updateStandbyIntroFlash();
+void sendOperationModeToPowerController(uint8_t mode);
+void sendDrainFillStartToPowerController();
+void sendFanControlToPowerController(bool fanOn);
+void sendScentPumpSetPointToPowerController(uint8_t setPoint);
+void sendUiSettingsToPowerController();
+void sendPowerOnCommand();
+void sendPowerOffCommand();
+void sendHeartbeatAckToPowerController();
+void sendCabinLightSetPoint(uint8_t percent);
+void saveSettingsToEEPROM();
+void saveStandbyTimeIfChanged();
+void returnToDefaultTargetTemperatureDisplay();
+void showDefaultActualTemperatureDisplay();
+void startTargetTemperatureIntroBlink();
+void updateTemperatureBlinkDisplay();
+void cancelOtherTemporaryDisplaysForCabinLight();
+bool consumeS5DecreaseAction();
+bool consumeS7IncreaseAction();
+bool consumeS6LongPressAction();
+void clearS5S7AdjustmentEvents();
+void startS6SharedButtonGuard();
+bool updateServiceModeLogic();
+void showServiceModeDisplay();
+void sendSlaveStatusRequest(uint8_t slaveId);
+void sendSlaveServiceSet(uint8_t slaveId, uint8_t requestedStatus);
+void updateDrainModeDisplay();
+void updateNormalSessionDisplay();
+void restoreNormalDisplayAfterCabinLight();
+void setDisplayCabinLightPercent(uint8_t percent);
+void triggerLocalE11CommunicationError();
+void enterSettingMode();
+void updatePowerOnPending();
+void updateErrorDisplay();
+void piezoBuzz();
+void fastBeeping();
+void fastBeeping2();
+void resetFastBeepingUp();
+void resetFastBeepingDown();
+void triggerBuzzer(uint16_t durationMs);
+void updateErrorBuzzer();
+
+
+// ======================================================
+// GLOBAL VARIABLES
+// ======================================================
+
+const uint8_t segmentPins[8] = {
+  SEG_A_PIN,
+  SEG_B_PIN,
+  SEG_C_PIN,
+  SEG_D_PIN,
+  SEG_E_PIN,
+  SEG_F_PIN,
+  SEG_G_PIN,
+  SEG_DP_PIN
+};
+
+const uint8_t columnPins[5] = {
+  COL1_PIN,
+  COL2_PIN,
+  COL3_PIN,
+  COL4_PIN,
+  COL5_PIN
+};
+
+volatile char displayChars[4] = { ' ', ' ', ' ', ' ' };
+volatile bool displayDecimalPoint[4] = { false, false, false, false };
+
+volatile uint8_t indicatorMask = 0;
+
+static volatile bool displayOutputEnabled = false;
+static volatile bool displayRefreshPaused = false;
+
+volatile uint8_t currentColumn = 0;
+unsigned long lastDisplayRefreshUs = 0;
+
+unsigned long lastHeartbeatSendTime = 0;
+unsigned long lastVersionRequestTime = 0;
+unsigned long startupStateStartTime = 0;
+
+bool pcVersionReceived = false;
+uint8_t pcVersionMajor = 0;
+uint8_t pcVersionMinor = 0;
+
+// ======================================================
+// S2 CABIN LIGHT BUTTON VARIABLES
+// ======================================================
+
+static bool s2StablePressed = false;
+static bool s2LastRawPressed = false;
+static unsigned long s2LastChangeTime = 0;
+static bool s2PressEvent = false;
+
+// ======================================================
+// CABIN LIGHT STATE VARIABLES
+// ======================================================
+
+static bool cabinLightOn = false;
+static uint8_t cabinLightSetPointPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+
+// Error light behavior:
+// When an error becomes visible, the UI turns the cabin light ON once only.
+// After that, the user can still toggle the light ON/OFF even while the
+// error remains displayed.
+static bool errorLightAutoApplied = false;
+
+// ======================================================
+// CABIN LIGHT DIMMER UI VARIABLES
+// ======================================================
+
+static bool cabinLightDimmerEnabled = false;
+static bool cabinLightAdjustMode = false;
+static bool cabinLightWaitingForStatusAfterKey = false;
+static unsigned long lastCabinLightKeyTime = 0;
+
+
+#define CABIN_LIGHT_ADJUST_TIMEOUT_MS 5000UL
+
+// ======================================================
+// S3 FAN / SCENT PUMP BUTTON VARIABLES
+// ======================================================
+
+static bool s3StablePressed = false;
+static bool s3LastRawPressed = false;
+static unsigned long s3LastChangeTime = 0;
+static unsigned long s3PressStartTime = 0;
+static bool s3ShortPressEvent = false;
+static bool s3LongPressEvent = false;
+static bool s3LongPressReported = false;
+
+// Fan / Scent requested state
+static bool fanRequestedOn = false;
+static bool scentPumpRequestedOn = false;
+
+// Scent Pump setpoint:
+// 1..19 = interval operation
+// 20    = continuously ON
+// No zero setpoint in the User Interface.
+static uint8_t scentPumpSetPoint = 1;
+
+static bool scentPumpAdjustMode = false;
+static unsigned long lastScentPumpKeyTime = 0;
+
+// ======================================================
+// S1 ON/OFF BUTTON VARIABLES
+// ======================================================
+
+static bool s1StablePressed = false;
+static bool s1LastRawPressed = false;
+static unsigned long s1LastChangeTime = 0;
+static bool s1PressEvent = false;
+
+// ======================================================
+// S5 DOWN AND S7 UP BUTTON VARIABLES
+// ======================================================
+
+static bool s4StablePressed = false;
+static bool s4LastRawPressed = false;
+static unsigned long s4LastChangeTime = 0;
+static unsigned long s4PressStartTime = 0;
+static bool s4ShortPressEvent = false;
+static bool s4LongPressEvent = false;
+static bool s4LongPressReported = false;
+
+static bool s5StablePressed = false;
+static bool s5LastRawPressed = false;
+static unsigned long s5LastChangeTime = 0;
+static bool s5PressEvent = false;
+
+static bool s7StablePressed = false;
+static bool s7LastRawPressed = false;
+static unsigned long s7LastChangeTime = 0;
+static bool s7PressEvent = false;
+
+static unsigned long s5LastFastRepeatTime = 0;
+static unsigned long s7LastFastRepeatTime = 0;
+
+static bool s6StablePressed = false;
+static bool s6LastRawPressed = false;
+static unsigned long s6LastChangeTime = 0;
+static unsigned long s6PressStartTime = 0;
+static bool s6ShortPressEvent = false;
+static bool s6LongPressEvent = false;
+static bool s6LongPressPending = false;
+static bool s6LongPressReported = false;
+
+static unsigned long lastSharedButtonScanTime = 0;
+static unsigned long s6SharedButtonGuardUntilTime = 0;
+
+// ======================================================
+// ON/OFF STATE VARIABLES
+// ======================================================
+
+static int16_t temperatureSetPointC = TARGET_TEMP_DEFAULT_C;
+static int16_t maxTargetTemperatureC = 50;
+
+static uint16_t selectedSessionTimeMin = 30;
+static uint16_t maxSessionTimeMinFromDip = 30;
+
+static uint16_t selectedStandbyTimeMin = 240;
+static uint16_t maxStandbyTimeMinFromDip = 240;
+static bool standbyDisabledByDip = false;
+
+#define COUNTDOWN_UNLIMITED_SECONDS 0xFFFFFFFFUL
+static uint32_t remainingSessionTimeSec = 30UL * 60UL;
+static uint32_t remainingStandbyTimeSec = 240UL * 60UL;
+static unsigned long lastLocalCountdownTickTime = 0;
+
+static bool dipSettingsReceived = false;
+static unsigned long lastDipSettingsRequestTime = 0;
+
+static unsigned long lastPowerCommandTime = 0;
+
+static bool showTempBlinking = false;
+static unsigned long tempBlinkStartTime = 0;
+static unsigned long lastTempBlinkToggleTime = 0;
+static bool tempBlinkVisible = true;
+
+// Actual cabin temperature received from the Power Controller through heartbeat ACK.
+static int16_t currentActualTemperatureC = TARGET_TEMP_DEFAULT_C;
+static bool currentActualTemperatureValid = false;
+
+/*
+  New display behavior:
+    - After ON request is accepted, show target temperature blinking for 5 seconds.
+    - After the 5-second target blink, default Session display becomes actual cabin temperature.
+    - S4 opens the 5-button menu at Fan first.
+*/
+static bool uiFiveButtonMenuActive = false;
+
+// ======================================================
+// ERROR DISPLAY VARIABLES
+// ======================================================
+
+static uint8_t activeErrorCode = 0;  // 0 = no error, 1..13 = E1..E13
+
+// Slave-error display support. When true, UI displays Sx -> Ex instead of normal Ex.
+static bool activeErrorFromSlave = false;
+static uint8_t activeErrorSlaveId = 0;
+static bool slaveErrorDisplayShowSlave = true;
+static unsigned long lastSlaveErrorDisplayToggleTime = 0;
+
+// Service Mode for viewing/setting slave status.
+// Status: 0=--, 1=OK, 2=Ex, 3=OF.
+static bool serviceModeActive = false;
+static bool serviceModeIntroActive = false;
+static unsigned long serviceModeIntroStartTime = 0;
+static uint8_t serviceSelectedSlave = 1;
+static uint8_t serviceSlaveStatus[MAX_GENERATOR_SLAVES + 1] = {0};
+static uint8_t serviceSlaveError[MAX_GENERATOR_SLAVES + 1] = {0};
+static uint8_t serviceDesiredStatus = 1; // user selectable: 1=OK, 3=OF.
+static unsigned long lastServiceStatusRequestTime = 0;
+static unsigned long lastServiceDisplayToggleTime = 0;
+static bool serviceDisplayShowSlave = true;
+static unsigned long serviceEntryHoldStartTime = 0;
+static bool serviceEntryTriggered = false;
+static unsigned long serviceS4SaveHoldStartTime = 0;
+static bool serviceS4SaveDone = false;
+
+
+// ======================================================
+// BUZZER VARIABLES - reference UI style
+// ======================================================
+
+unsigned long prevbeepBuzzer = 0;
+long beepBuzzerInterval = 500;
+
+unsigned long prevbeepBuzzer2 = 0;
+long beepBuzzerInterval2 = 500;
+
+unsigned long beepbeep2 = 1000;
+long beepbeepInterval2 = 1000;
+
+unsigned long beepInterval = 1000;
+
+byte peZO = BUZZER_PIN;
+byte pzDetect = 0;
+byte piezoState = LOW;
+long previousMilpiezo = 0;
+long intervalpiezo = 500;
+unsigned long previousMilBuz = 0;
+long intervalBuz = 500;
+
+unsigned long prevpiezoing = 0;
+
+byte stopPzDetect = 0;
+unsigned int piezoTone = 4000;
+
+
+
+/*
+  Error is allowed to be received/stored during startup, but it must not
+  interrupt the PC/UI version display.
+
+  errorDisplayActive becomes true when:
+    - the system is already ON and an error arrives, or
+    - the user presses S6 while a stored error exists, or
+    - UI-side E11 is triggered, or
+    - E13 generator-chain fault is received after startup.
+
+  E13 is special: slave mode without master acknowledgement must be shown
+  immediately after startup/OFF-state timeout. Other physical faults can remain
+  stored until the user attempts ON.
+*/
+static bool errorDisplayActive = false;
+
+static bool errorBlinkVisible = true;
+static unsigned long lastErrorBlinkToggleTime = 0;
+
+// ======================================================
+// COMMUNICATION WATCHDOG VARIABLES
+// ======================================================
+
+static bool heartbeatAckReceived = false;
+static unsigned long lastHeartbeatAckTime = 0;
+static bool localE11Active = false;
+
+// ======================================================
+// STARTUP SEQUENCE STATE
+// ======================================================
+
+enum UiStartupState {
+  UI_START_REQUEST_PC_VERSION = 0,
+  UI_START_SHOW_PC_VERSION,
+  UI_START_SHOW_UI_VERSION,
+  UI_START_OFF,
+  UI_START_FAIL
+};
+
+enum UiMainState {
+  UI_MAIN_STARTUP = 0,
+  UI_MAIN_OFF,
+  UI_MAIN_POWER_ON_PENDING,
+  UI_MAIN_ON,
+  UI_MAIN_ERROR
+};
+
+static UiMainState uiMainState = UI_MAIN_STARTUP;
+
+enum UiOperationMode {
+  UI_MODE_SESSION = 0,
+  UI_MODE_STANDBY = 1
+};
+
+static UiOperationMode uiOperationMode = UI_MODE_SESSION;
+
+enum UiNormalDisplayMode {
+  UI_NORMAL_DISPLAY_TEMPERATURE = 0,
+  UI_NORMAL_DISPLAY_SESSION_TIME = 1
+};
+
+static UiNormalDisplayMode uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+
+static bool standbyTimeAdjustMode = false;
+static bool standbyTimeValueChanged = false;
+static unsigned long lastStandbyKeyTime = 0;
+
+/*
+  True only when EEPROM contains valid saved user settings.
+
+  This prevents the Power Controller DIP reply from overwriting the
+  user-saved Standby Time with the factory default 240 minutes / 4 hours
+  after reset.
+*/
+static bool settingsLoadedFromEEPROM = false;
+
+static bool standbyFlashActive = false;
+static bool standbyFlashShowWord = true;
+static unsigned long standbyFlashStartTime = 0;
+static unsigned long lastStandbyFlashToggleTime = 0;
+
+static bool drainDisplayActive = false;
+static bool drainFlashShowWord = true;
+static uint8_t drainDisplayStep = 0;  // Fill prep: 0=dr steady. Drain: 0=dr, 1=time.
+static unsigned long lastDrainFlashToggleTime = 0;
+static uint8_t pcDrainState = 0;  // 0=idle, 1=filling to Probe1, 2=draining
+static uint8_t previousPcDrainState = 0;
+static uint32_t remainingDrainTimeSec = 10UL * 60UL;
+
+enum UiSettingMode {
+  UI_SETTING_NONE = 0,
+  UI_SETTING_TEMPERATURE,
+  UI_SETTING_SESSION_TIME
+};
+
+static UiSettingMode uiSettingMode = UI_SETTING_NONE;
+static unsigned long lastSettingKeyTime = 0;
+
+/*
+  New 5-button menu model:
+    S4 cycles Fan -> Target Temperature -> Scent Pump -> Session Time -> Fan.
+    S5/S7 adjust the currently displayed feature.
+*/
+enum UiFiveButtonMenuFeature {
+  UI_MENU_TARGET_TEMP = 0,
+  UI_MENU_FAN,
+  UI_MENU_SCENT_PUMP,
+  UI_MENU_SESSION_TIME
+};
+
+static UiFiveButtonMenuFeature uiFiveButtonMenuFeature = UI_MENU_FAN;
+static bool uiFiveButtonMenuDirty = false;
+static unsigned long lastFiveButtonMenuKeyTime = 0;
+
+/*
+  Setting-mode indicator blink:
+    While the S4 settings menu is active, only the selected feature LED
+    blinks at 0.3 s ON / 0.3 s OFF.
+    The seven-segment display remains steady except for the separate
+    ON-entry target-temperature intro blink.
+*/
+static const unsigned long SETTING_FEATURE_LED_BLINK_INTERVAL_MS = 300UL;
+static bool settingFeatureLedVisible = true;
+static unsigned long lastSettingFeatureLedBlinkTime = 0;
+
+/*
+  Fan menu display behavior:
+    - When Fan menu is selected by S4, display is blank.
+    - When S7 is pressed, display shows ON.
+    - When S5 is pressed, display shows OFF.
+*/
+static bool fanMenuActionDisplayActive = false;
+
+static UiStartupState startupState = UI_START_REQUEST_PC_VERSION;
+
+// ======================================================
+// DISPLAY FUNCTIONS
+// ======================================================
+
+void writeSegmentPin(uint8_t pin, bool on) {
+#if SEGMENT_ACTIVE_LOW
+  digitalWrite(pin, on ? LOW : HIGH);
+#else
+  digitalWrite(pin, on ? HIGH : LOW);
+#endif
+}
+
+void writeColumnPin(uint8_t pin, bool on) {
+#if COLUMN_ACTIVE_LOW
+  digitalWrite(pin, on ? LOW : HIGH);
+#else
+  digitalWrite(pin, on ? HIGH : LOW);
+#endif
+}
+
+void allColumnsOff() {
+  for (uint8_t i = 0; i < 5; i++) {
+    writeColumnPin(columnPins[i], false);
+  }
+}
+
+void allSegmentsOff() {
+  for (uint8_t i = 0; i < 8; i++) {
+    writeSegmentPin(segmentPins[i], false);
+  }
+}
+
+void clearDisplayBuffer() {
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+  displayChars[2] = ' ';
+  displayChars[3] = ' ';
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+
+  indicatorMask = 0;
+}
+
+void allOff() {
+  clearDisplayBuffer();
+  allColumnsOff();
+  allSegmentsOff();
+}
+
+void disableDisplayOutput() {
+  displayOutputEnabled = false;
+  displayRefreshPaused = true;
+  allOff();
+}
+
+void enableDisplayOutput() {
+  displayRefreshPaused = false;
+  displayOutputEnabled = true;
+}
+
+void pauseDisplayRefreshForButtonRead() {
+  /*
+    Timer1 now refreshes the 7-segment display.
+    During shared-button scanning, pause the ISR refresh so it cannot
+    re-drive S4/S5/S6/S7 segment pins while they are temporarily inputs.
+  */
+  displayRefreshPaused = true;
+  allColumnsOff();
+  allSegmentsOff();
+}
+
+void resumeDisplayRefreshAfterButtonRead() {
+  allColumnsOff();
+  allSegmentsOff();
+  displayRefreshPaused = false;
+}
+
+void preloadDisplayPinsOff() {
+  /*
+    Preload inactive output latch levels before switching pins to OUTPUT.
+    This reduces the small LED/display flash during power-up/reset.
+  */
+  for (uint8_t i = 0; i < 8; i++) {
+#if SEGMENT_ACTIVE_LOW
+    digitalWrite(segmentPins[i], HIGH);
+#else
+    digitalWrite(segmentPins[i], LOW);
+#endif
+  }
+
+  for (uint8_t i = 0; i < 5; i++) {
+#if COLUMN_ACTIVE_LOW
+    digitalWrite(columnPins[i], HIGH);
+#else
+    digitalWrite(columnPins[i], LOW);
+#endif
+  }
+}
+
+void setSegmentPinsOutput() {
+  for (uint8_t i = 0; i < 8; i++) {
+    pinMode(segmentPins[i], OUTPUT);
+  }
+}
+
+uint8_t patternForChar(char c) {
+  switch (c) {
+    case '0': return 0b00111111;
+    case '1': return 0b00000110;
+    case '2': return 0b01011011;
+    case '3': return 0b01001111;
+    case '4': return 0b01100110;
+    case '5': return 0b01101101;
+    case '6': return 0b01111101;
+    case '7': return 0b00000111;
+    case '8': return 0b01111111;
+    case '9': return 0b01101111;
+
+    case 'A': return 0b01110111;
+    case 'C': return 0b00111001;
+    case 'E': return 0b01111001;
+    case 'F': return 0b01110001;
+    case 'H': return 0b01110110;
+    case 'I': return 0b00000110;
+    case 'K': return 0b01110110;  // approximate K as H on 7-segment
+    case 'L': return 0b00111000;
+    case 'M': return 0b00010101;  // Approximate M: segments A, C, E ON
+    case 'm': return 0b00010101;  // Approximate m/M on 7-segment
+    case 'N': return 0b01010100;
+    case 'n': return 0b01010100;
+    case 'O': return 0b00111111;
+    case 'P': return 0b01110011;
+    case 'S': return 0b01010101;  // Custom S for slave/service display: segments A, C, E, G ON
+    case 's': return 0b01101101;  // Full S-style character used for Standby word
+    case 'T': return 0b01111000;
+    case 'Y': return 0b01101110;
+    case 'y': return 0b01101110;  // lower-case y approximation for Stby
+    case 'd': return 0b01011110;
+    case 'r': return 0b01010000;
+    case 't': return 0b01111000;
+    case 'o': return 0b01011100;
+    case 'B': return 0b01111100;
+    case 'b': return 0b01111100;
+    case '-': return 0b01000000;
+    case ' ': return 0b00000000;
+
+    default:
+      return 0b00000000;
+  }
+}
+
+void displayPattern(uint8_t pattern, bool decimalPoint) {
+  for (uint8_t i = 0; i < 7; i++) {
+    bool segOn = (pattern & (1 << i)) != 0;
+    writeSegmentPin(segmentPins[i], segOn);
+  }
+
+  writeSegmentPin(SEG_DP_PIN, decimalPoint);
+}
+
+void setDisplayText(const char *text) {
+  for (uint8_t i = 0; i < 4; i++) {
+    if (text[i] == '\0') {
+      displayChars[i] = ' ';
+    } else {
+      displayChars[i] = text[i];
+    }
+
+    displayDecimalPoint[i] = false;
+  }
+}
+
+void setDisplayPcVersion(uint8_t major, uint8_t minor) {
+  /*
+    Power Controller version display.
+
+    Layout:
+      [blank] [blank] [major] [minor]
+
+    Example:
+      version 1.9 displays as: __19
+  */
+
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+  displayChars[2] = '0' + major;
+  displayChars[3] = '0' + minor;
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+}
+
+void setDisplayTemperatureSetPoint(int16_t tempC) {
+  /*
+    Example:
+      40 -> "  40"
+      5  -> "   5"
+  */
+
+  if (tempC < 0) {
+    tempC = 0;
+  }
+
+  if (tempC > 99) {
+    tempC = 99;
+  }
+
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+
+  if (tempC >= 10) {
+    displayChars[2] = '0' + (tempC / 10);
+    displayChars[3] = '0' + (tempC % 10);
+  } else {
+    displayChars[2] = ' ';
+    displayChars[3] = '0' + tempC;
+  }
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+}
+
+void setDisplayActualTemperatureC(int16_t tempC) {
+  /*
+    Actual cabin temperature display.
+    Uses the same 2-digit format as target temperature.
+    If the received value is outside the displayable range, clamp to 0..99.
+  */
+  setDisplayTemperatureSetPoint(tempC);
+}
+
+void setDisplayActualTemperatureUnavailable() {
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+  displayChars[2] = '-';
+  displayChars[3] = '-';
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+}
+
+void setDisplayScentPumpSetPoint(uint8_t setPoint) {
+  /*
+    Display scent pump setpoint:
+      0  -> "   0"
+      1  -> "   1"
+      10 -> "  10"
+      20 -> "  20"
+  */
+
+  if (setPoint > SCENT_PUMP_MAX_SETPOINT) {
+    setPoint = SCENT_PUMP_MAX_SETPOINT;
+  }
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+
+  if (setPoint >= 10) {
+    displayChars[2] = '0' + (setPoint / 10);
+    displayChars[3] = '0' + (setPoint % 10);
+  } else {
+    displayChars[2] = ' ';
+    displayChars[3] = '0' + setPoint;
+  }
+}
+
+void setDisplaySessionTime(uint16_t sessionMin) {
+  /*
+    Displays time in timer format:
+      5 min    -> 0:05
+      10 min   -> 0:10
+      60 min   -> 1:00
+      240 min  -> 4:00
+      1440 min -> 24:00
+
+    Colon behavior:
+      The original UI turns ON the DP segment while COL3 and COL4
+      are active. Therefore displayDecimalPoint[2] and [3] are used.
+  */
+
+  if (sessionMin == SESSION_TIME_UNLIMITED || sessionMin >= SESSION_TIME_24H_MIN) {
+    sessionMin = SESSION_TIME_24H_MIN;
+  }
+
+  uint16_t hours = sessionMin / 60;
+  uint16_t minutes = sessionMin % 60;
+
+  if (hours > 24) {
+    hours = 24;
+    minutes = 0;
+  }
+
+  if (hours >= 10) {
+    displayChars[0] = '0' + (hours / 10);
+    displayChars[1] = '0' + (hours % 10);
+  } else {
+    displayChars[0] = ' ';
+    displayChars[1] = '0' + hours;
+  }
+
+  displayChars[2] = '0' + (minutes / 10);
+  displayChars[3] = '0' + (minutes % 10);
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = true;
+  displayDecimalPoint[3] = true;
+}
+
+
+uint16_t secondsToDisplayMinutesCeil(uint32_t secondsValue) {
+  if (secondsValue == COUNTDOWN_UNLIMITED_SECONDS) {
+    return SESSION_TIME_UNLIMITED;
+  }
+
+  return (uint16_t)((secondsValue + 59UL) / 60UL);
+}
+
+void setDisplayCountdownSeconds(uint32_t secondsValue) {
+  /*
+    Runtime countdown display rule based on the original UI appearance:
+
+      30 minutes -> 0:30
+      5 minutes  -> 0:05
+      1 minute   -> 0:01
+      50 seconds ->  50   centered, no colon
+      9 seconds  ->  09   centered, no colon
+
+    Important:
+      - The timer still counts down internally in seconds.
+      - While remaining time is 60 seconds or more, the display shows hours/minutes.
+      - When remaining time is below 60 seconds, the display shows seconds only.
+  */
+
+  if (secondsValue == COUNTDOWN_UNLIMITED_SECONDS) {
+    setDisplaySessionTime(SESSION_TIME_24H_MIN);
+    return;
+  }
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+
+  if (secondsValue < 60UL) {
+    /*
+      Below 1 minute:
+        50 -> " 50 "
+        09 -> " 09 "
+
+      This keeps one blank digit on the left and one blank digit on the right.
+      No colon / decimal points are used.
+    */
+    uint8_t seconds = (uint8_t)secondsValue;
+
+    displayChars[0] = ' ';
+    displayChars[1] = '0' + (seconds / 10);
+    displayChars[2] = '0' + (seconds % 10);
+    displayChars[3] = ' ';
+    return;
+  }
+
+  /*
+    1 minute and above:
+      Show H:MM / HH:MM.
+
+      1800 seconds -> 30 minutes -> 0:30
+       300 seconds ->  5 minutes -> 0:05
+        60 seconds ->  1 minute  -> 0:01
+
+    Seconds are intentionally hidden until below 1 minute.
+  */
+  uint16_t displayMinutes = (uint16_t)(secondsValue / 60UL);
+
+  if (displayMinutes >= SESSION_TIME_24H_MIN) {
+    displayMinutes = SESSION_TIME_24H_MIN;
+  }
+
+  setDisplaySessionTime(displayMinutes);
+}
+
+void setDisplayBlank() {
+  clearDisplayBuffer();
+}
+
+void setSevenSegmentBlankOnly() {
+  /*
+    Blank only the 4 seven-segment display digits.
+    Do not clear indicatorMask, because the ON-entry target-temperature
+    blink must blink only the numeric display, not the LED indicators.
+  */
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+  displayChars[2] = ' ';
+  displayChars[3] = ' ';
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+}
+
+void setDisplayColonOnly() {
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+  displayChars[2] = ' ';
+  displayChars[3] = ' ';
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = true;
+  displayDecimalPoint[3] = true;
+}
+
+void showOffStateDisplay() {
+  setDisplayColonOnly();
+  indicatorMask = 0;
+}
+
+void setDisplaySlaveId(uint8_t slaveId) {
+  if (slaveId > 9) {
+    slaveId = 9;
+  }
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+  displayChars[0] = ' ';
+  displayChars[1] = ' ';
+  displayChars[2] = 'S';
+  displayChars[3] = (char)('0' + slaveId);
+}
+
+void setDisplayOkText() {
+  setDisplayText(" OK ");
+}
+
+void setDisplayOfText() {
+  setDisplayText(" OF ");
+}
+
+void setDisplayMissingText() {
+  setDisplayText(" -- ");
+}
+
+void setDisplayServiceModeText() {
+  setDisplayText(" Sm ");
+}
+
+
+void setDisplayError(uint8_t errorCode) {
+  /*
+    Displays:
+      E1  as "  E1"
+      E9  as "  E9"
+      E10 as " E10"
+      E13 as " E13"
+  */
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+
+  if (errorCode == 0) {
+    setDisplayBlank();
+    return;
+  }
+
+  if (errorCode < 10) {
+    displayChars[0] = ' ';
+    displayChars[1] = ' ';
+    displayChars[2] = 'E';
+    displayChars[3] = '0' + errorCode;
+  } else {
+    displayChars[0] = ' ';
+    displayChars[1] = 'E';
+    displayChars[2] = '0' + (errorCode / 10);
+    displayChars[3] = '0' + (errorCode % 10);
+  }
+}
+
+void setDisplayUiVersion(uint8_t major, uint8_t minor) {
+  /*
+    User Interface version display.
+
+    Layout:
+      [major] [minor] [blank] [blank]
+
+    Example:
+      version 1.8 displays as: 18__
+  */
+
+  displayChars[0] = '0' + major;
+  displayChars[1] = '0' + minor;
+  displayChars[2] = ' ';
+  displayChars[3] = ' ';
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+}
+
+
+void allColumnsOffFast() {
+#if COLUMN_ACTIVE_LOW
+  PORTC |= 0b00111100;  // PC2..PC5 = COL1..COL4 OFF
+  PORTD |= (1 << PD4);  // PD4 = COL5 OFF
+#else
+  PORTC &= ~0b00111100;
+  PORTD &= ~(1 << PD4);
+#endif
+}
+
+void allSegmentsOffFast() {
+#if SEGMENT_ACTIVE_LOW
+  PORTB |= 0b00111111;  // PB0..PB5 = A..F OFF
+  PORTC |= 0b00000011;  // PC0..PC1 = G, DP OFF
+#else
+  PORTB &= ~0b00111111;
+  PORTC &= ~0b00000011;
+#endif
+}
+
+void displayPatternFast(uint8_t pattern, bool decimalPoint) {
+  uint8_t portBOnMask = pattern & 0b00111111;
+  uint8_t portCOnMask = 0;
+
+  if (pattern & 0b01000000) {
+    portCOnMask |= (1 << PC0);
+  }
+
+  if (decimalPoint) {
+    portCOnMask |= (1 << PC1);
+  }
+
+#if SEGMENT_ACTIVE_LOW
+  PORTB = (PORTB | 0b00111111) & ~portBOnMask;
+  PORTC = (PORTC | 0b00000011) & ~portCOnMask;
+#else
+  PORTB = (PORTB & ~0b00111111) | portBOnMask;
+  PORTC = (PORTC & ~0b00000011) | portCOnMask;
+#endif
+}
+
+void writeColumnPinFast(uint8_t columnIndex, bool on) {
+  if (!on) {
+    return;
+  }
+
+#if COLUMN_ACTIVE_LOW
+  if (columnIndex < 4) {
+    PORTC &= ~(1 << (PC2 + columnIndex));
+  } else {
+    PORTD &= ~(1 << PD4);
+  }
+#else
+  if (columnIndex < 4) {
+    PORTC |= (1 << (PC2 + columnIndex));
+  } else {
+    PORTD |= (1 << PD4);
+  }
+#endif
+}
+
+void refreshDisplayFromTimer() {
+  /*
+    Runs from Timer1 every 1 ms.
+
+    Important for buzzer quality:
+      This ISR uses direct PORT writes only. digitalWrite() and pinMode() are
+      too slow inside a 1 ms ISR and can disturb Arduino tone() at 4 kHz,
+      causing a rough/zigzag HNR-1707 sound.
+  */
+
+  if (!displayOutputEnabled || displayRefreshPaused) {
+    return;
+  }
+
+  allColumnsOffFast();
+  allSegmentsOffFast();
+
+  if (currentColumn < 4) {
+    char c = displayChars[currentColumn];
+    bool dp = displayDecimalPoint[currentColumn];
+    uint8_t pattern = patternForChar(c);
+
+    displayPatternFast(pattern, dp);
+    writeColumnPinFast(currentColumn, true);
+  } else {
+    uint8_t leds = indicatorMask;
+    displayPatternFast(leds, false);
+    writeColumnPinFast(4, true);
+  }
+
+  currentColumn++;
+  if (currentColumn >= 5) {
+    currentColumn = 0;
+  }
+}
+
+void refreshDisplay() {
+  /*
+    Legacy wrapper kept so old calls compile.
+    Display refresh is now handled by Timer1 ISR.
+  */
+}
+
+void setupDisplayRefreshTimer1() {
+  /*
+    Timer1 CTC interrupt at 1 ms for stable 7-segment multiplexing.
+
+    Timer0 remains free for millis()/micros().
+    Timer2 remains free.
+  */
+
+  noInterrupts();
+
+  TCCR1A = 0;
+  TCCR1B = 0;
+  TCNT1 = 0;
+
+  /*
+    ATmega328P at 16 MHz:
+      prescaler 8 -> 0.5 us/tick
+      1000 us -> 2000 ticks
+      OCR1A = 1999
+  */
+  OCR1A = (uint16_t)(((F_CPU / 1000000UL) * DISPLAY_TIMER1_REFRESH_US) / 8UL) - 1;
+
+  TCCR1B |= (1 << WGM12);  // CTC mode
+  TCCR1B |= (1 << CS11);   // prescaler 8
+  TIMSK1 |= (1 << OCIE1A);
+
+  interrupts();
+}
+
+ISR(TIMER1_COMPA_vect) {
+  refreshDisplayFromTimer();
+}
+
+
+void autoTurnCabinLightOnForErrorOnce() {
+  /*
+    New error-light rule:
+      - When an error first becomes visible, turn the cabin light ON once.
+      - Do not keep forcing it ON.
+      - While the error remains active, the user can still toggle the light
+        ON/OFF using the Light/S3 button.
+  */
+
+  if (errorLightAutoApplied) {
+    return;
+  }
+
+  errorLightAutoApplied = true;
+
+  cabinLightOn = true;
+
+  if (cabinLightSetPointPercent == 0) {
+    cabinLightSetPointPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+  }
+
+  cabinLightAdjustMode = false;
+  cabinLightWaitingForStatusAfterKey = false;
+  indicatorMask |= LED_CABIN_LIGHT;
+
+  sendCabinLightSetPoint(cabinLightSetPointPercent);
+}
+
+void syncCabinLightLedIndicator() {
+  /*
+    Cabin Light LED indicator rule:
+      The Cabin Light LED must follow the actual cabinLightOn state.
+
+    Why this is needed:
+      Some display functions intentionally clear indicatorMask when they blank
+      or update the seven-segment display. During Error State, the display
+      blinks between E-code and blank. If the blank function clears
+      indicatorMask, the Light LED can accidentally turn OFF even though the
+      cabin light output is still ON.
+
+    Final behavior:
+      - Error first appears: cabin light turns ON once and this LED turns ON.
+      - User presses Light/S3: cabin light turns OFF and this LED turns OFF.
+      - User presses Light/S3 again: cabin light turns ON and this LED turns ON.
+      - Error display blinking must not affect this LED.
+  */
+
+  if (cabinLightOn) {
+    indicatorMask |= LED_CABIN_LIGHT;
+  } else {
+    indicatorMask &= ~LED_CABIN_LIGHT;
+  }
+}
+
+void activateErrorDisplayNow(uint8_t errorCode) {
+  /*
+    Activates the flashing error display after startup is finished.
+
+    Important:
+      This function must not be called during the PC/UI version display,
+      otherwise E1-E13 will interrupt the version startup sequence.
+  */
+
+  if (errorCode == 0) {
+    return;
+  }
+
+  if (startupState != UI_START_OFF) {
+    return;
+  }
+
+  errorDisplayActive = true;
+  activeErrorCode = errorCode;
+  slaveErrorDisplayShowSlave = true;
+  lastSlaveErrorDisplayToggleTime = millis();
+
+  /*
+    Manual-reset error model:
+      An error that becomes visible is its own UI state, not OFF.
+      It remains here until the user holds S6 for 2 seconds.
+  */
+  uiMainState = UI_MAIN_ERROR;
+  uiOperationMode = UI_MODE_SESSION;
+  uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+
+  showTempBlinking = false;
+  drainDisplayActive = false;
+  cabinLightAdjustMode = false;
+  scentPumpAdjustMode = false;
+  standbyTimeAdjustMode = false;
+  uiSettingMode = UI_SETTING_NONE;
+
+  indicatorMask = 0;
+
+  autoTurnCabinLightOnForErrorOnce();
+
+  errorBlinkVisible = true;
+  lastErrorBlinkToggleTime = millis();
+  setDisplayError(activeErrorCode);
+}
+
+// ======================================================
+// S1 ON/OFF BUTTON FUNCTIONS
+// ======================================================
+
+bool readS1RawPressed() {
+  /*
+    S1 uses INPUT_PULLUP, so pressed = LOW.
+  */
+  return digitalRead(S1_ON_OFF_PIN) == LOW;
+}
+
+bool readS2RawPressed() {
+  /*
+    S2 uses INPUT_PULLUP, so pressed = LOW.
+  */
+  return digitalRead(S2_CABIN_LIGHT_PIN) == LOW;
+}
+
+void updateS2Button() {
+  bool rawPressed = readS2RawPressed();
+  unsigned long now = millis();
+
+  s2PressEvent = false;
+
+  if (rawPressed != s2LastRawPressed) {
+    s2LastRawPressed = rawPressed;
+    s2LastChangeTime = now;
+  }
+
+  if ((now - s2LastChangeTime) >= BUTTON_DEBOUNCE_MS) {
+    if (rawPressed != s2StablePressed) {
+      s2StablePressed = rawPressed;
+
+      if (s2StablePressed) {
+        s2PressEvent = true;
+      }
+    }
+  }
+}
+
+bool readS3RawPressed() {
+  /*
+    S3 is connected to ADC6.
+    ADC6 is analog-only, so use analogRead(A6), not digitalRead().
+
+    Not pressed: pulled up near 1023.
+    Pressed: pulled low near 0.
+  */
+
+  int adcValue = analogRead(S3_ADC_PIN);
+
+  return adcValue < S3_PRESSED_ADC_MAX;
+}
+unsigned long getS3RequiredHoldMs() {
+  /*
+    S3:
+      Not adjusting scent pump -> 3 sec fan toggle
+      Adjusting scent pump     -> 10 sec save
+  */
+
+  if (scentPumpAdjustMode) {
+    return SETTINGS_SAVE_HOLD_MS;
+  }
+
+  return S3_HOLD_MS;
+}
+
+unsigned long getS4RequiredHoldMs() {
+  /*
+    New 5-button S4 behavior:
+      Session/Menu mode -> hold 2 seconds to save feature values.
+      Standby mode      -> hold 5 seconds to start Force Drain.
+  */
+
+  if (uiMainState == UI_MAIN_ON && uiOperationMode == UI_MODE_STANDBY) {
+    return S4_FORCE_DRAIN_HOLD_MS;
+  }
+
+  return S4_MENU_SAVE_HOLD_MS;
+}
+
+unsigned long getS6RequiredHoldMs() {
+  /*
+    New 5-button S6 behavior:
+      OFF state             -> short press = ON.
+      Session mode          -> short press = Standby.
+      Standby mode          -> short press = Session.
+      Session/Standby mode  -> hold 2 seconds = OFF.
+  */
+
+  return S6_POWER_OFF_HOLD_MS;
+}
+
+void updateS3Button() {
+  /*
+    S3 behavior:
+      Short press       = toggle Scent Pump
+      Hold for 3 sec    = toggle Fan
+
+    Release-based short press:
+      A long press must not also count as a short press.
+  */
+
+  bool rawPressed = readS3RawPressed();
+  unsigned long now = millis();
+
+  s3ShortPressEvent = false;
+  s3LongPressEvent = false;
+
+  if (rawPressed != s3LastRawPressed) {
+    s3LastRawPressed = rawPressed;
+    s3LastChangeTime = now;
+  }
+
+  if ((now - s3LastChangeTime) >= BUTTON_DEBOUNCE_MS) {
+    if (rawPressed != s3StablePressed) {
+      s3StablePressed = rawPressed;
+
+      if (s3StablePressed) {
+        s3PressStartTime = now;
+        s3LongPressReported = false;
+      } else {
+        if (!s3LongPressReported) {
+          s3ShortPressEvent = true;
+        }
+      }
+    }
+  }
+
+  if (s3StablePressed && !s3LongPressReported && ((now - s3PressStartTime) >= getS3RequiredHoldMs())) {
+    s3LongPressReported = true;
+    s3LongPressEvent = true;
+  }
+}
+
+void updateS1Button() {
+  bool rawPressed = readS1RawPressed();
+  unsigned long now = millis();
+
+  s1PressEvent = false;
+
+  if (rawPressed != s1LastRawPressed) {
+    s1LastRawPressed = rawPressed;
+    s1LastChangeTime = now;
+  }
+
+  if ((now - s1LastChangeTime) >= BUTTON_DEBOUNCE_MS) {
+    if (rawPressed != s1StablePressed) {
+      s1StablePressed = rawPressed;
+
+      if (s1StablePressed) {
+        s1PressEvent = true;
+      }
+    }
+  }
+}
+
+void prepareSharedPinsForButtonRead() {
+  /*
+    S4, S5, S6, and S7 share display segment pins.
+    Pause Timer1 display refresh before reading these pins.
+  */
+
+  pauseDisplayRefreshForButtonRead();
+
+  pinMode(SEG_A_PIN, INPUT_PULLUP);  // S5
+  pinMode(SEG_B_PIN, INPUT_PULLUP);  // S4
+  pinMode(SEG_C_PIN, INPUT_PULLUP);  // S6
+  pinMode(SEG_D_PIN, INPUT_PULLUP);  // S7
+
+  delayMicroseconds(80);
+}
+
+void restoreSharedPinsAfterButtonRead() {
+  pinMode(SEG_A_PIN, OUTPUT);
+  pinMode(SEG_B_PIN, OUTPUT);
+  pinMode(SEG_C_PIN, OUTPUT);
+  pinMode(SEG_D_PIN, OUTPUT);
+
+  resumeDisplayRefreshAfterButtonRead();
+}
+
+void updateSharedButton(
+  bool rawPressed,
+  bool *stablePressed,
+  bool *lastRawPressed,
+  unsigned long *lastChangeTime,
+  bool *pressEvent) {
+  unsigned long now = millis();
+
+  *pressEvent = false;
+
+  if (rawPressed != *lastRawPressed) {
+    *lastRawPressed = rawPressed;
+    *lastChangeTime = now;
+  }
+
+  if ((now - *lastChangeTime) >= BUTTON_DEBOUNCE_MS) {
+    if (rawPressed != *stablePressed) {
+      *stablePressed = rawPressed;
+
+      if (*stablePressed) {
+        *pressEvent = true;
+      }
+    }
+  }
+}
+
+void updateS4SharedButton(bool rawPressed) {
+  /*
+    S4 uses release-based short press detection so a 5-second hold
+    does not also count as a short press.
+  */
+
+  unsigned long now = millis();
+
+  s4ShortPressEvent = false;
+  s4LongPressEvent = false;
+
+  if (rawPressed != s4LastRawPressed) {
+    s4LastRawPressed = rawPressed;
+    s4LastChangeTime = now;
+  }
+
+  if ((now - s4LastChangeTime) >= BUTTON_DEBOUNCE_MS) {
+    if (rawPressed != s4StablePressed) {
+      s4StablePressed = rawPressed;
+
+      if (s4StablePressed) {
+        s4PressStartTime = now;
+        s4LongPressReported = false;
+      } else {
+        if (!s4LongPressReported) {
+          s4ShortPressEvent = true;
+        }
+      }
+    }
+  }
+
+  if (s4StablePressed && !s4LongPressReported && ((now - s4PressStartTime) >= getS4RequiredHoldMs())) {
+    s4LongPressReported = true;
+    s4LongPressEvent = true;
+  }
+}
+
+void updateS6SharedButton(bool rawPressed) {
+  /*
+    S6 uses release-based short press detection so a 5-second hold
+    does not also count as a short press.
+  */
+
+  unsigned long now = millis();
+
+  s6ShortPressEvent = false;
+  s6LongPressEvent = false;
+
+  if (rawPressed != s6LastRawPressed) {
+    s6LastRawPressed = rawPressed;
+    s6LastChangeTime = now;
+  }
+
+  if ((now - s6LastChangeTime) >= BUTTON_DEBOUNCE_MS) {
+    if (rawPressed != s6StablePressed) {
+      s6StablePressed = rawPressed;
+
+      if (s6StablePressed) {
+        s6PressStartTime = now;
+        s6LongPressReported = false;
+      } else {
+        if (!s6LongPressReported) {
+          s6ShortPressEvent = true;
+        }
+      }
+    }
+  }
+
+  if (s6StablePressed && !s6LongPressReported && ((now - s6PressStartTime) >= getS6RequiredHoldMs())) {
+    s6LongPressReported = true;
+    s6LongPressEvent = true;
+    s6LongPressPending = true;
+  }
+}
+
+bool consumeS6LongPressAction() {
+  /*
+    Robust S6 long-press detection.
+
+    Expected behavior:
+      - Short S6 press in normal ON state toggles display between
+        Target Temperature and Session Time.
+      - Short press S6 enters adjustment mode for whichever
+        item is currently displayed.
+      - Holding S6 again while already adjusting saves and exits.
+
+    This helper also catches the long press even if the one-loop
+    s6LongPressEvent was missed because S6 is a shared display pin.
+  */
+
+  if (s6LongPressEvent || s6LongPressPending) {
+    s6LongPressEvent = false;
+    s6LongPressPending = false;
+    return true;
+  }
+
+  if (s6StablePressed && !s6LongPressReported && ((millis() - s6PressStartTime) >= getS6RequiredHoldMs())) {
+    s6LongPressReported = true;
+    s6LongPressPending = false;
+    s6LongPressEvent = false;
+    return true;
+  }
+
+  return false;
+}
+
+void clearS5S7AdjustmentEvents() {
+  /*
+    Clears pending S5/S7 adjustment events.
+
+    Important:
+      This function must NOT extend the S6 guard timer.
+      Extending the guard timer here can permanently block S5/S7
+      because updateS5S7Buttons() calls this while the guard is active.
+  */
+
+  unsigned long now = millis();
+
+  s5PressEvent = false;
+  s7PressEvent = false;
+
+  s5StablePressed = false;
+  s5LastRawPressed = false;
+  s5LastChangeTime = now;
+
+  s7StablePressed = false;
+  s7LastRawPressed = false;
+  s7LastChangeTime = now;
+
+  s5LastFastRepeatTime = now;
+  s7LastFastRepeatTime = now;
+}
+
+void startS6SharedButtonGuard() {
+  /*
+    Briefly blocks S5/S7 after S6 activity.
+    This prevents a short S6 press from being misread as S5/S7,
+    but still allows S5/S7 to work normally after the guard expires.
+  */
+
+  s6SharedButtonGuardUntilTime = millis() + S6_SHARED_BUTTON_GUARD_MS;
+}
+
+bool s5S7AdjustmentBlocked() {
+  return ((long)(millis() - s6SharedButtonGuardUntilTime) < 0);
+}
+
+void updateS5S7Buttons() {
+  /*
+    S4, S5, S6, and S7 share display segment pins.
+
+    Important:
+      Do not scan them every loop.
+      Scanning every loop turns the display OFF too often.
+
+    S6 guard:
+      S6 can briefly appear as S5/S7 because of the shared segment matrix.
+      While S6 is pressed, or shortly after S6 is released, S5/S7 adjustment
+      events are blocked so a short S6 press cannot change Session Time.
+  */
+
+  unsigned long now = millis();
+
+  if ((now - lastSharedButtonScanTime) < SHARED_BUTTON_SCAN_INTERVAL_MS) {
+    return;
+  }
+
+  lastSharedButtonScanTime = now;
+
+  prepareSharedPinsForButtonRead();
+
+  bool rawS4 = digitalRead(S4_STANDBY_PIN) == LOW;
+  bool rawS5 = digitalRead(S5_DOWN_PIN) == LOW;
+  bool rawS6 = digitalRead(S6_TEMP_TIME_PIN) == LOW;
+  bool rawS7 = digitalRead(S7_UP_PIN) == LOW;
+
+  restoreSharedPinsAfterButtonRead();
+
+  updateS4SharedButton(rawS4);
+  updateS6SharedButton(rawS6);
+
+  if (rawS6 || s6StablePressed || s6ShortPressEvent || s6LongPressEvent) {
+    startS6SharedButtonGuard();
+  }
+
+  if ((long)(now - s6SharedButtonGuardUntilTime) < 0) {
+    rawS5 = false;
+    rawS7 = false;
+    clearS5S7AdjustmentEvents();
+  }
+
+  updateSharedButton(rawS5, &s5StablePressed, &s5LastRawPressed, &s5LastChangeTime, &s5PressEvent);
+  updateSharedButton(rawS7, &s7StablePressed, &s7LastRawPressed, &s7LastChangeTime, &s7PressEvent);
+}
+
+
+bool consumeS5DecreaseAction() {
+  /*
+    S5 value adjustment:
+      - single press = one decrease step
+      - hold = repeated decrease steps after a short delay
+  */
+
+  if (s5S7AdjustmentBlocked()) {
+    s5PressEvent = false;
+    return false;
+  }
+
+  unsigned long now = millis();
+
+  if (s5PressEvent) {
+    s5PressEvent = false;
+    s5LastFastRepeatTime = now;
+    return true;
+  }
+
+  if (s5StablePressed && ((now - s5LastChangeTime) >= BUTTON_FAST_REPEAT_START_MS) && ((now - s5LastFastRepeatTime) >= BUTTON_FAST_REPEAT_INTERVAL_MS)) {
+    s5LastFastRepeatTime = now;
+    return true;
+  }
+
+  return false;
+}
+
+bool consumeS7IncreaseAction() {
+  /*
+    S7 value adjustment:
+      - single press = one increase step
+      - hold = repeated increase steps after a short delay
+  */
+
+  if (s5S7AdjustmentBlocked()) {
+    s7PressEvent = false;
+    return false;
+  }
+
+  unsigned long now = millis();
+
+  if (s7PressEvent) {
+    s7PressEvent = false;
+    s7LastFastRepeatTime = now;
+    return true;
+  }
+
+  if (s7StablePressed && ((now - s7LastChangeTime) >= BUTTON_FAST_REPEAT_START_MS) && ((now - s7LastFastRepeatTime) >= BUTTON_FAST_REPEAT_INTERVAL_MS)) {
+    s7LastFastRepeatTime = now;
+    return true;
+  }
+
+  return false;
+}
+// ======================================================
+// ICSC FUNCTIONS
+// ======================================================
+
+void sendHeartbeatToPowerController() {
+  /*
+    HALF-DUPLEX RS485 HEARTBEAT RULE:
+
+      UI is the heartbeat master.
+      UI sends heartbeat request to the Power Controller every 1 second.
+      Power Controller replies with CMD_HEARTBEAT_ACK.
+
+    This avoids UI and Power Controller transmitting at the same time on the
+    half-duplex RS485 bus.
+  */
+
+  char payload[1];
+  payload[0] = 1;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_HEARTBEAT, sizeof(payload), payload);
+  lastHeartbeatSendTime = millis();
+}
+
+void sendHeartbeatAckToPowerController() {
+  /*
+    Legacy compatibility only.
+
+    In the new half-duplex heartbeat method, the Power Controller should not
+    send independent heartbeat requests. The UI is the master and the Power
+    Controller replies.
+
+    This function is kept so older Power Controller test builds can still be
+    acknowledged if needed.
+  */
+
+  char payload[1];
+  payload[0] = 1;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_HEARTBEAT_ACK, sizeof(payload), payload);
+}
+
+void sendVersionRequestToPowerController() {
+  char payload[1];
+  payload[0] = 1;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_VERSION_REQUEST, sizeof(payload), payload);
+  lastVersionRequestTime = millis();
+}
+
+void sendDipSettingsRequestToPowerController() {
+  char payload[1];
+  payload[0] = 1;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_DIP_REQUEST, sizeof(payload), payload);
+  lastDipSettingsRequestTime = millis();
+}
+
+void sendUiSettingsToPowerController() {
+  /*
+    Payload:
+      [0] target temperature, 30..50/55
+      [1] session time low byte
+      [2] session time high byte
+      [3] standby time low byte
+      [4] standby time high byte
+  */
+
+  uint16_t sessionToSend = selectedSessionTimeMin;
+  uint16_t standbyToSend = selectedStandbyTimeMin;
+
+  if (maxSessionTimeMinFromDip == SESSION_TIME_UNLIMITED && selectedSessionTimeMin >= SESSION_TIME_24H_MIN) {
+    sessionToSend = SESSION_TIME_UNLIMITED;
+  }
+
+  if (standbyDisabledByDip) {
+    standbyToSend = 0;
+  } else if (maxStandbyTimeMinFromDip == SESSION_TIME_UNLIMITED && selectedStandbyTimeMin >= SESSION_TIME_24H_MIN) {
+    standbyToSend = SESSION_TIME_UNLIMITED;
+  }
+
+  char payload[5];
+  payload[0] = (char)temperatureSetPointC;
+  payload[1] = (char)(sessionToSend & 0xFF);
+  payload[2] = (char)((sessionToSend >> 8) & 0xFF);
+  payload[3] = (char)(standbyToSend & 0xFF);
+  payload[4] = (char)((standbyToSend >> 8) & 0xFF);
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_UI_SETTINGS, sizeof(payload), payload);
+}
+
+void sendOperationModeToPowerController(uint8_t mode) {
+  /*
+    Payload:
+      0 = Session mode
+      1 = Standby mode
+  */
+
+  char payload[1];
+  payload[0] = (char)mode;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_SET_OPERATION_MODE, sizeof(payload), payload);
+}
+
+void sendDrainFillStartToPowerController() {
+  /*
+    Force drain request from UI.
+    Valid only after user enters Standby mode and holds S4 for 3 seconds.
+  */
+
+  char payload[1];
+  payload[0] = 1;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_DRAIN_FILL_START, sizeof(payload), payload);
+}
+
+void sendFanControlToPowerController(bool fanOn) {
+  char payload[1];
+  payload[0] = fanOn ? 1 : 0;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_FAN_CONTROL, sizeof(payload), payload);
+}
+
+void sendScentPumpSetPointToPowerController(uint8_t setPoint) {
+  /*
+    0  = OFF
+    1..19 = interval settings
+    20 = continuous ON request
+  */
+
+  if (setPoint > 20) {
+    setPoint = 20;
+  }
+
+  char payload[1];
+  payload[0] = (char)setPoint;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_SCENT_PUMP_SETPOINT, sizeof(payload), payload);
+}
+
+uint32_t readUint32FromPayload(char *data, uint8_t index) {
+  return ((uint32_t)(uint8_t)data[index + 0]) | ((uint32_t)(uint8_t)data[index + 1] << 8) | ((uint32_t)(uint8_t)data[index + 2] << 16) | ((uint32_t)(uint8_t)data[index + 3] << 24);
+}
+
+void onHeartbeatFromPowerController(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  /*
+    Legacy compatibility only.
+
+    New rule:
+      UI is heartbeat master.
+      Power Controller should not transmit independent heartbeat requests.
+
+    If an older Power Controller still sends CMD_HEARTBEAT, receiving it still
+    proves communication is alive, but the new Power Controller v26 will not
+    use this path.
+  */
+  heartbeatAckReceived = true;
+  lastHeartbeatAckTime = millis();
+
+  if (localE11Active && activeErrorCode == 11 && !errorDisplayActive) {
+    localE11Active = false;
+    activeErrorCode = 0;
+  }
+
+  /*
+    Do not automatically reply here in the new half-duplex heartbeat design.
+    This prevents both sides from creating ping-pong traffic.
+  */
+}
+
+void onHeartbeatAck(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  heartbeatAckReceived = true;
+  lastHeartbeatAckTime = millis();
+
+  /*
+    During startup/version display, do not allow heartbeat status to overwrite
+    the screen. This prevents old drain-display text such as "to" from
+    appearing before the version numbers.
+  */
+  if (startupState != UI_START_OFF) {
+    if (localE11Active && activeErrorCode == 11 && !errorDisplayActive) {
+      localE11Active = false;
+      activeErrorCode = 0;
+    }
+
+    return;
+  }
+
+  /*
+    Extended heartbeat ACK payload from Power Controller:
+      [0] controller state
+      [1] operation mode: 0 = Session, 1 = Standby
+      [2..5] remaining SessionTime in seconds
+      [6..9] remaining StandbyTime in seconds
+      [10] Auto Drain state: 0=idle, 1=filling to Probe1, 2=draining
+      [11..14] remaining DrainTime in seconds
+  */
+  if (len >= 10 && activeErrorCode == 0) {
+    uint8_t pcState = (uint8_t)data[0];
+    uint8_t pcMode = (uint8_t)data[1];
+
+    remainingSessionTimeSec = readUint32FromPayload(data, 2);
+    remainingStandbyTimeSec = readUint32FromPayload(data, 6);
+
+    if (len >= 15) {
+      pcDrainState = (uint8_t)data[10];
+      remainingDrainTimeSec = readUint32FromPayload(data, 11);
+    } else {
+      pcDrainState = 0;
+      remainingDrainTimeSec = 0;
+    }
+
+    /*
+      Extended heartbeat ACK payload from Power Controller v41+:
+        [15] NTC1 / cabin actual temperature, signed int8 Celsius
+        [16] NTC2 / tank actual temperature, signed int8 Celsius
+
+      UI displays NTC1 as actual cabin temperature after the 5-second
+      target-temperature intro blink.
+    */
+    if (len >= 17) {
+      currentActualTemperatureC = (int8_t)data[15];
+      currentActualTemperatureValid = true;
+
+      if (uiMainState == UI_MAIN_ON &&
+          uiOperationMode == UI_MODE_SESSION &&
+          !showTempBlinking &&
+          !uiFiveButtonMenuActive &&
+          !normalDisplayIsBlocked()) {
+        showDefaultActualTemperatureDisplay();
+      }
+    }
+
+    lastLocalCountdownTickTime = millis();
+
+    if (pcDrainState == 1 || pcDrainState == 2) {
+      bool enteringNewDrainState = (!drainDisplayActive || previousPcDrainState != pcDrainState);
+
+      drainDisplayActive = true;
+      previousPcDrainState = pcDrainState;
+
+      if (enteringNewDrainState) {
+        drainFlashShowWord = true;
+        drainDisplayStep = 0;
+        lastDrainFlashToggleTime = millis();
+      }
+
+      uiSettingMode = UI_SETTING_NONE;
+      cabinLightAdjustMode = false;
+      standbyTimeAdjustMode = false;
+      stopStandbyIntroFlash();
+      updateDrainModeDisplay();
+      return;
+    }
+
+    if (pcDrainState == 0 && drainDisplayActive) {
+      drainDisplayActive = false;
+      previousPcDrainState = 0;
+      drainDisplayStep = 0;
+    }
+
+    if (pcState == 0 && uiMainState == UI_MAIN_ON) {
+      uiMainState = UI_MAIN_OFF;
+      uiOperationMode = UI_MODE_SESSION;
+      uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+      standbyTimeAdjustMode = false;
+      standbyTimeValueChanged = false;
+      showTempBlinking = false;
+      drainDisplayActive = false;
+      stopStandbyIntroFlash();
+      showOffStateDisplay();
+      return;
+    }
+
+    if (uiMainState == UI_MAIN_ON && pcMode == 1 && uiOperationMode != UI_MODE_STANDBY) {
+      uiOperationMode = UI_MODE_STANDBY;
+      standbyTimeAdjustMode = true;
+      standbyTimeValueChanged = false;
+      lastStandbyKeyTime = millis();
+      uiSettingMode = UI_SETTING_NONE;
+      cabinLightAdjustMode = false;
+      startStandbyIntroFlash();
+    } else if (uiMainState == UI_MAIN_ON && pcMode == 0 && uiOperationMode != UI_MODE_SESSION) {
+      uiOperationMode = UI_MODE_SESSION;
+      uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+      standbyTimeAdjustMode = false;
+      standbyTimeValueChanged = false;
+      stopStandbyIntroFlash();
+      updateNormalSessionDisplay();
+    }
+  }
+
+  /*
+    Manual-reset rule also applies to UI-created E11:
+      Communication returning must not hide an already displayed E11.
+      It may only clear a stored/non-displayed E11.
+  */
+  if (localE11Active && activeErrorCode == 11 && !errorDisplayActive) {
+    localE11Active = false;
+    activeErrorCode = 0;
+  }
+}
+
+void onPowerOnAck(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  if (len < 1) {
+    return;
+  }
+
+  bool accepted = data[0] != 0;
+
+  if (accepted) {
+    /*
+      If a Power Controller error was already received/stored,
+      do not enter normal ON display. Show the error instead.
+    */
+    if (activeErrorCode != 0) {
+      activateErrorDisplayNow(activeErrorCode);
+      return;
+    }
+
+    uiMainState = UI_MAIN_ON;
+
+    uiOperationMode = UI_MODE_SESSION;
+    uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+    uiFiveButtonMenuFeature = UI_MENU_FAN;
+    uiFiveButtonMenuDirty = false;
+
+    uiFiveButtonMenuActive = false;
+    startTargetTemperatureIntroBlink();
+
+    indicatorMask = LED_ON | LED_TEMP;
+
+  } else {
+    /*
+      Power Controller can reject an ON request temporarily while it is still
+      completing startup/OFF-state validation or the multiple-generator
+      discovery scan.
+
+      Previous behavior:
+        ACK=false immediately returned the UI to OFF, so the user often needed
+        to press S6 a second time after the Power Controller became ready.
+
+      New behavior:
+        If no error code was reported, keep UI_MAIN_POWER_ON_PENDING and let
+        updatePowerOnPending() retry the ON command automatically. If a real
+        error is reported, onErrorReport() will display it.
+    */
+    if (activeErrorCode != 0) {
+      uiMainState = UI_MAIN_OFF;
+      uiOperationMode = UI_MODE_SESSION;
+      uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+      standbyTimeAdjustMode = false;
+      standbyTimeValueChanged = false;
+      showTempBlinking = false;
+      activateErrorDisplayNow(activeErrorCode);
+    } else {
+      uiMainState = UI_MAIN_POWER_ON_PENDING;
+      setDisplayBlank();
+      indicatorMask = 0;
+    }
+  }
+}
+
+void onErrorReport(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (len < 1) {
+    return;
+  }
+
+  uint8_t receivedError = (uint8_t)data[0];
+  bool receivedFromSlave = false;
+  uint8_t receivedSlaveId = 0;
+
+  /*
+    Payload formats:
+      [0] errorCode                         -> Master/local error
+      [0] errorCode, [1]=1, [2]=slaveId     -> Slave error Sx/Ex from Master
+
+    The UI is always connected to the Master board. For accidental slave-DIP
+    testing, E13 from slave addresses 3..9 is still accepted.
+  */
+  if (len >= 3 && (uint8_t)data[1] == 1) {
+    receivedFromSlave = true;
+    receivedSlaveId = (uint8_t)data[2];
+  }
+
+  bool fromMainPowerController = (station == POWER_CONTROLLER_ADDRESS);
+  bool fromGeneratorSlaveAddress = (station >= 3 && station <= 9);
+
+  if (!fromMainPowerController) {
+    if (!(receivedError == 13 && fromGeneratorSlaveAddress)) {
+      return;
+    }
+    receivedFromSlave = true;
+    receivedSlaveId = (uint8_t)(station - POWER_CONTROLLER_ADDRESS);
+  }
+
+  if (receivedError > 13) {
+    receivedError = 13;
+  }
+
+  if (receivedSlaveId > MAX_GENERATOR_SLAVES) {
+    receivedSlaveId = 0;
+    receivedFromSlave = false;
+  }
+
+  uint8_t previousError = activeErrorCode;
+  bool previousWasSlaveError = activeErrorFromSlave;
+  uint8_t previousSlaveId = activeErrorSlaveId;
+  bool wasErrorDisplayActive = errorDisplayActive;
+
+  if (receivedError == 0) {
+    localE11Active = false;
+
+    if (errorDisplayActive && activeErrorCode != 0) {
+      return;
+    }
+
+    activeErrorCode = 0;
+    errorLightAutoApplied = false;
+    activeErrorFromSlave = false;
+    activeErrorSlaveId = 0;
+    errorDisplayActive = false;
+
+    if (uiMainState == UI_MAIN_ERROR) {
+      uiMainState = UI_MAIN_OFF;
+      showOffStateDisplay();
+    }
+
+    return;
+  }
+
+  activeErrorCode = receivedError;
+  activeErrorFromSlave = receivedFromSlave;
+  activeErrorSlaveId = receivedSlaveId;
+
+  if (startupState != UI_START_OFF) {
+    errorDisplayActive = false;
+    return;
+  }
+
+  if (receivedError == 13 ||
+      uiMainState == UI_MAIN_ON ||
+      uiMainState == UI_MAIN_POWER_ON_PENDING ||
+      uiMainState == UI_MAIN_ERROR ||
+      errorDisplayActive) {
+
+    bool changed = (!wasErrorDisplayActive) ||
+                   (previousError != activeErrorCode) ||
+                   (previousWasSlaveError != activeErrorFromSlave) ||
+                   (previousSlaveId != activeErrorSlaveId);
+
+    if (changed) {
+      errorLightAutoApplied = false;
+      activateErrorDisplayNow(activeErrorCode);
+    }
+  }
+}
+
+void sendSlaveStatusRequest(uint8_t slaveId) {
+  char payload[1];
+  payload[0] = (char)slaveId;
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_SLAVE_STATUS_REQUEST, sizeof(payload), payload);
+}
+
+void sendSlaveServiceSet(uint8_t slaveId, uint8_t requestedStatus) {
+  char payload[2];
+  payload[0] = (char)slaveId;
+  payload[1] = (char)requestedStatus; // 1=OK, 3=OF
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_SLAVE_SERVICE_SET, sizeof(payload), payload);
+}
+
+void onSlaveStatusReply(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  if (station != POWER_CONTROLLER_ADDRESS || len < 3 || data == NULL) {
+    return;
+  }
+  uint8_t slaveId = (uint8_t)data[0];
+  uint8_t status = (uint8_t)data[1];
+  uint8_t errorCode = (uint8_t)data[2];
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES) {
+    return;
+  }
+  if (status > 3) {
+    status = 0;
+  }
+  if (errorCode > 13) {
+    errorCode = 13;
+  }
+  serviceSlaveStatus[slaveId] = status;
+  serviceSlaveError[slaveId] = errorCode;
+  if (serviceModeActive && slaveId == serviceSelectedSlave) {
+    serviceDesiredStatus = (status == 3) ? 3 : 1;
+  }
+}
+
+void onSlaveServiceAck(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  if (station != POWER_CONTROLLER_ADDRESS || len < 2 || data == NULL) {
+    return;
+  }
+  uint8_t slaveId = (uint8_t)data[0];
+  uint8_t status = (uint8_t)data[1];
+  if (slaveId >= 1 && slaveId <= MAX_GENERATOR_SLAVES) {
+    serviceSlaveStatus[slaveId] = status;
+    if (status == 1 || status == 3) {
+      serviceSlaveError[slaveId] = 0;
+    }
+  }
+}
+
+void sendCabinLightSetPoint(uint8_t percent) {
+  /*
+    Payload:
+      0   = Cabin Light OFF
+      100 = Cabin Light ON / full brightness
+
+    Later, when dimmer adjustment is added:
+      0, 5, 10, ... 100
+  */
+
+  if (percent > 100) {
+    percent = 100;
+  }
+
+  percent = (percent / 5) * 5;
+
+  char payload[1];
+  payload[0] = (char)percent;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_CABIN_LIGHT_SETPOINT, sizeof(payload), payload);
+}
+
+void onCabinLightStatus(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  if (len < 4) {
+    return;
+  }
+
+  /*
+    Power Controller payload:
+      [0] DIP8 dimmer enabled, 0/1
+      [1] requested ON, 0/1
+      [2] level percent, 0..100
+      [3] actual output state, 0/1
+  */
+
+  cabinLightDimmerEnabled = data[0] != 0;
+
+  bool requestedOn = data[1] != 0;
+  uint8_t levelPercent = (uint8_t)data[2];
+
+  cabinLightOn = requestedOn;
+
+  /*
+    Do not let an OFF status with levelPercent = 0 erase the saved dimming level.
+    The UI must remember the last non-zero cabin-light dimming value.
+  */
+  if (levelPercent > 0) {
+    if (levelPercent > 100) {
+      levelPercent = 100;
+    }
+
+    cabinLightSetPointPercent = (levelPercent / 5) * 5;
+
+    if (cabinLightSetPointPercent == 0) {
+      cabinLightSetPointPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+    }
+  } else if (cabinLightOn) {
+    if (cabinLightSetPointPercent == 0) {
+      cabinLightSetPointPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+    }
+  }
+
+  if (cabinLightOn) {
+    indicatorMask |= LED_CABIN_LIGHT;
+  } else {
+    indicatorMask &= ~LED_CABIN_LIGHT;
+  }
+
+  /*
+    Critical rule:
+
+    If DIP8 is OFF:
+      force basic ON/OFF mode.
+      no setpoint display.
+      no adjustment mode.
+  */
+  if (!cabinLightDimmerEnabled) {
+    cabinLightAdjustMode = false;
+    cabinLightWaitingForStatusAfterKey = false;
+
+    restoreNormalDisplayAfterCabinLight();
+    return;
+  }
+
+  /*
+    If DIP8 is ON and the user just pressed S2:
+      show setpoint and allow adjustment.
+  */
+  if (cabinLightWaitingForStatusAfterKey) {
+    cabinLightWaitingForStatusAfterKey = false;
+
+    if (cabinLightOn && activeErrorCode == 0) {
+      cabinLightAdjustMode = true;
+      lastCabinLightKeyTime = millis();
+      setDisplayCabinLightPercent(cabinLightSetPointPercent);
+    } else {
+      cabinLightAdjustMode = false;
+      restoreNormalDisplayAfterCabinLight();
+    }
+  }
+}
+void onDipSettingsReply(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  if (len < 11) {
+    return;
+  }
+
+  uint16_t receivedMaxSession =
+    (uint16_t)(uint8_t)data[1] | ((uint16_t)(uint8_t)data[2] << 8);
+
+  uint16_t receivedMaxStandby =
+    (uint16_t)(uint8_t)data[3] | ((uint16_t)(uint8_t)data[4] << 8);
+
+  bool receivedStandbyDisabled = data[5] != 0;
+
+  uint16_t receivedStartStandby =
+    (uint16_t)(uint8_t)data[8] | ((uint16_t)(uint8_t)data[9] << 8);
+
+  uint8_t receivedMaxTempC = (uint8_t)data[10];
+
+  maxTargetTemperatureC = (receivedMaxTempC == 55) ? 55 : 50;
+  maxSessionTimeMinFromDip = receivedMaxSession;
+  maxStandbyTimeMinFromDip = receivedMaxStandby;
+  standbyDisabledByDip = receivedStandbyDisabled;
+
+  if (temperatureSetPointC < TARGET_TEMP_MIN_C) {
+    temperatureSetPointC = TARGET_TEMP_MIN_C;
+  }
+
+  if (temperatureSetPointC > maxTargetTemperatureC) {
+    temperatureSetPointC = maxTargetTemperatureC;
+  }
+
+  if (maxSessionTimeMinFromDip != SESSION_TIME_UNLIMITED && selectedSessionTimeMin > maxSessionTimeMinFromDip) {
+    selectedSessionTimeMin = maxSessionTimeMinFromDip;
+  }
+
+  if (selectedSessionTimeMin < SESSION_TIME_MIN_MIN) {
+    selectedSessionTimeMin = SESSION_TIME_MIN_MIN;
+  }
+
+  if (standbyDisabledByDip) {
+    selectedStandbyTimeMin = 0;
+  } else {
+    /*
+      EEPROM standby-time fix:
+        The Power Controller DIP reply contains receivedStartStandby, usually
+        the factory default 240 minutes / 4 hours.
+
+        If EEPROM already loaded a valid user-saved standby time, do NOT
+        overwrite it with receivedStartStandby. Only use receivedStartStandby
+        when EEPROM is blank/invalid and the UI is using factory defaults.
+    */
+    if (!settingsLoadedFromEEPROM) {
+      if (receivedStartStandby >= SESSION_TIME_MIN_MIN && receivedStartStandby != SESSION_TIME_UNLIMITED) {
+        selectedStandbyTimeMin = receivedStartStandby;
+      }
+    }
+
+    if (maxStandbyTimeMinFromDip != SESSION_TIME_UNLIMITED && selectedStandbyTimeMin > maxStandbyTimeMinFromDip) {
+      selectedStandbyTimeMin = maxStandbyTimeMinFromDip;
+    }
+
+    if (selectedStandbyTimeMin < SESSION_TIME_MIN_MIN) {
+      selectedStandbyTimeMin = SESSION_TIME_MIN_MIN;
+    }
+  }
+
+  dipSettingsReceived = true;
+}
+
+void onFanStatus(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  if (len < 3) {
+    return;
+  }
+
+  /*
+    Power Controller payload:
+      [0] requested state, 0/1
+      [1] DIP7 enabled, 0/1
+      [2] actual output state, 0/1
+  */
+
+  bool requested = data[0] != 0;
+  bool dipEnabled = data[1] != 0;
+
+  fanRequestedOn = requested && dipEnabled;
+
+  if (fanRequestedOn) {
+    indicatorMask |= LED_FAN;
+  } else {
+    indicatorMask &= ~LED_FAN;
+  }
+}
+
+void onScentPumpStatus(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  if (len < 4) {
+    return;
+  }
+
+  /*
+    Power Controller payload:
+      [0] set-point, 0..20
+      [1] DIP6 enabled, 0/1
+      [2] allowed now, 0/1
+      [3] actual output state, 0/1
+  */
+
+  uint8_t receivedSetPoint = (uint8_t)data[0];
+  bool dipEnabled = data[1] != 0;
+
+  scentPumpRequestedOn = (receivedSetPoint > 0) && dipEnabled;
+
+  if (scentPumpRequestedOn) {
+    indicatorMask |= LED_SCENT;
+  } else {
+    indicatorMask &= ~LED_SCENT;
+  }
+}
+
+void onUiSettingsAck(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+}
+
+void onVersionReply(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != POWER_CONTROLLER_ADDRESS) {
+    return;
+  }
+
+  if (len < 2) {
+    return;
+  }
+
+  pcVersionMajor = (uint8_t)data[0];
+  pcVersionMinor = (uint8_t)data[1];
+
+  pcVersionReceived = true;
+
+  startupState = UI_START_SHOW_PC_VERSION;
+  startupStateStartTime = millis();
+
+  enableDisplayOutput();
+  setDisplayPcVersion(pcVersionMajor, pcVersionMinor);
+  indicatorMask = 0;
+}
+
+void updateHeartbeat() {
+  if ((millis() - lastHeartbeatSendTime) >= HEARTBEAT_INTERVAL_MS) {
+    sendHeartbeatToPowerController();
+  }
+}
+
+void updateDipSettingsRequest() {
+  if (dipSettingsReceived) {
+    return;
+  }
+
+  if (startupState != UI_START_OFF) {
+    return;
+  }
+
+  if ((millis() - lastDipSettingsRequestTime) >= DIP_REQUEST_INTERVAL_MS) {
+    sendDipSettingsRequestToPowerController();
+  }
+}
+
+void updateUiCommunicationWatchdog() {
+  /*
+    UI-side E11 rule:
+
+      UI sends heartbeat to Power Controller every 1 second.
+      Power Controller must reply with CMD_HEARTBEAT_ACK.
+
+      If the UI receives no heartbeat ACK / valid Power Controller response
+      for 10 seconds straight, UI displays E11.
+  */
+
+  bool communicationLost = false;
+
+  if (!heartbeatAckReceived) {
+    if (millis() >= HEARTBEAT_ACK_TIMEOUT_MS) {
+      communicationLost = true;
+    }
+  } else {
+    if ((millis() - lastHeartbeatAckTime) >= HEARTBEAT_ACK_TIMEOUT_MS) {
+      communicationLost = true;
+    }
+  }
+
+  if (communicationLost) {
+    triggerLocalE11CommunicationError();
+  }
+}
+
+void sendPowerOnCommand() {
+  /*
+    Before turning ON the Power Controller,
+    send the saved/default UI settings first.
+  */
+
+  sendUiSettingsToPowerController();
+
+  char payload[1];
+  payload[0] = 1;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_POWER_ON, sizeof(payload), payload);
+  lastPowerCommandTime = millis();
+}
+
+void sendPowerOffCommand() {
+  char payload[1];
+  payload[0] = 0;
+
+  ICSC.send(POWER_CONTROLLER_ADDRESS, CMD_POWER_OFF, sizeof(payload), payload);
+  lastPowerCommandTime = millis();
+}
+
+// ======================================================
+// STARTUP SEQUENCE
+// ======================================================
+
+void updateStartupSequence() {
+  unsigned long now = millis();
+
+  switch (startupState) {
+    case UI_START_REQUEST_PC_VERSION:
+      disableDisplayOutput();
+
+      if ((now - lastVersionRequestTime) >= VERSION_REQUEST_INTERVAL_MS) {
+        sendVersionRequestToPowerController();
+      }
+
+      if ((now - startupStateStartTime) >= HEARTBEAT_ACK_TIMEOUT_MS && !pcVersionReceived) {
+        /*
+          No Power Controller version received.
+          Treat this as E11 communication error.
+        */
+        startupState = UI_START_OFF;
+        uiMainState = UI_MAIN_OFF;
+
+        triggerLocalE11CommunicationError();
+      }
+      break;
+
+    case UI_START_SHOW_PC_VERSION:
+      if ((now - startupStateStartTime) >= VERSION_DISPLAY_TIME_MS) {
+        startupState = UI_START_SHOW_UI_VERSION;
+        startupStateStartTime = now;
+
+        setDisplayUiVersion(UI_VERSION_MAJOR, UI_VERSION_MINOR);
+        indicatorMask = 0;
+      }
+      break;
+
+    case UI_START_SHOW_UI_VERSION:
+      if ((now - startupStateStartTime) >= VERSION_DISPLAY_TIME_MS) {
+        startupState = UI_START_OFF;
+        startupStateStartTime = now;
+
+        uiMainState = UI_MAIN_OFF;
+
+        setDisplayColonOnly();
+        indicatorMask = 0;
+        sendDipSettingsRequestToPowerController();
+        triggerBuzzer(100);
+
+      }
+      break;
+
+    case UI_START_OFF:
+      setDisplayColonOnly();
+      indicatorMask = 0;
+      break;
+
+    case UI_START_FAIL:
+      setDisplayText("FAIL");
+      indicatorMask = 0;
+      break;
+  }
+}
+
+
+// ======================================================
+// 5-BUTTON UI FORWARD DECLARATIONS
+// ======================================================
+
+void updateStandbyModeDisplay();
+void startStandbyIntroFlash();
+void stopStandbyIntroFlash();
+void sendOperationModeToPowerController(uint8_t mode);
+void sendDrainFillStartToPowerController();
+void sendFanControlToPowerController(bool fanOn);
+void sendScentPumpSetPointToPowerController(uint8_t setPoint);
+void sendUiSettingsToPowerController();
+void sendPowerOnCommand();
+void sendPowerOffCommand();
+void sendHeartbeatAckToPowerController();
+void sendCabinLightSetPoint(uint8_t percent);
+void saveSettingsToEEPROM();
+void returnToDefaultTargetTemperatureDisplay();
+void showDefaultActualTemperatureDisplay();
+void startTargetTemperatureIntroBlink();
+void updateTemperatureBlinkDisplay();
+void cancelOtherTemporaryDisplaysForCabinLight();
+bool consumeS5DecreaseAction();
+bool consumeS7IncreaseAction();
+bool consumeS6LongPressAction();
+void clearS5S7AdjustmentEvents();
+void startS6SharedButtonGuard();
+bool updateServiceModeLogic();
+void showServiceModeDisplay();
+void sendSlaveStatusRequest(uint8_t slaveId);
+void sendSlaveServiceSet(uint8_t slaveId, uint8_t requestedStatus);
+
+// ======================================================
+// 5-BUTTON UI LOGIC
+// ======================================================
+
+void setDisplayFanState(bool fanOn) {
+  /*
+    Fan menu display after user action:
+      S7 -> ON
+      S5 -> OFF
+  */
+
+  if (fanOn) {
+    setDisplayText(" ON ");
+  } else {
+    setDisplayText("OFF ");
+  }
+}
+
+void setDisplayFanBlank() {
+  /*
+    Legacy helper kept for compatibility.
+    Fan menu now displays the actual fan state instead of blank.
+  */
+  setDisplayFanState(fanRequestedOn);
+}
+
+bool fiveButtonMenuAllowed() {
+  if (uiMainState != UI_MAIN_ON) {
+    return false;
+  }
+
+  if (uiOperationMode != UI_MODE_SESSION) {
+    return false;
+  }
+
+  if (activeErrorCode != 0) {
+    return false;
+  }
+
+  if (drainDisplayActive || cabinLightAdjustMode) {
+    return false;
+  }
+
+  return true;
+}
+
+bool selectedSettingLedShouldBeOn() {
+  unsigned long now = millis();
+
+  if ((now - lastSettingFeatureLedBlinkTime) >= SETTING_FEATURE_LED_BLINK_INTERVAL_MS) {
+    lastSettingFeatureLedBlinkTime = now;
+    settingFeatureLedVisible = !settingFeatureLedVisible;
+  }
+
+  return settingFeatureLedVisible;
+}
+
+void resetSettingFeatureLedBlink() {
+  settingFeatureLedVisible = true;
+  lastSettingFeatureLedBlinkTime = millis();
+}
+
+void showFiveButtonMenuDisplay() {
+  if (!fiveButtonMenuAllowed()) {
+    return;
+  }
+
+  indicatorMask &= ~(LED_TEMP | LED_SESSION | LED_STANDBY | LED_FAN | LED_SCENT);
+  indicatorMask |= LED_ON;
+
+  bool featureLedOn = selectedSettingLedShouldBeOn();
+
+  switch (uiFiveButtonMenuFeature) {
+    case UI_MENU_TARGET_TEMP:
+      if (featureLedOn) {
+        indicatorMask |= LED_TEMP;
+      }
+      setDisplayTemperatureSetPoint(temperatureSetPointC);
+      break;
+
+    case UI_MENU_FAN:
+      if (featureLedOn) {
+        indicatorMask |= LED_FAN;
+      }
+      /*
+        Fan menu must always display the current fan state:
+          OFF by default
+          ON when fanRequestedOn is true
+      */
+      setDisplayFanState(fanRequestedOn);
+      break;
+
+    case UI_MENU_SCENT_PUMP:
+      if (featureLedOn) {
+        indicatorMask |= LED_SCENT;
+      }
+      setDisplayScentPumpSetPoint(scentPumpSetPoint);
+      break;
+
+    case UI_MENU_SESSION_TIME:
+      if (featureLedOn) {
+        indicatorMask |= LED_SESSION;
+      }
+      setDisplaySessionTime(selectedSessionTimeMin);
+      break;
+  }
+}
+
+void markFiveButtonMenuChanged() {
+  uiFiveButtonMenuDirty = true;
+  lastFiveButtonMenuKeyTime = millis();
+}
+
+void saveFiveButtonMenuSettings() {
+  /*
+    Saves/sends all values controlled from the new S4 menu:
+      - Target Temperature
+      - Session Time
+      - Scent Pump setpoint
+      - Fan command
+
+    Fan state is sent to the Power Controller, but EEPROM persistence remains
+    for the existing saved settings only.
+  */
+
+  sendUiSettingsToPowerController();
+  sendScentPumpSetPointToPowerController(scentPumpSetPoint);
+  sendFanControlToPowerController(fanRequestedOn);
+  saveSettingsToEEPROM();
+  if (selectedSessionTimeMin == SESSION_TIME_UNLIMITED) {
+    remainingSessionTimeSec = COUNTDOWN_UNLIMITED_SECONDS;
+  } else {
+    remainingSessionTimeSec = (uint32_t)selectedSessionTimeMin * 60UL;
+  }
+
+  lastLocalCountdownTickTime = millis();
+
+  uiFiveButtonMenuDirty = false;
+  uiFiveButtonMenuFeature = UI_MENU_FAN;
+  uiFiveButtonMenuActive = false;
+  fanMenuActionDisplayActive = false;
+  uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+
+  triggerBuzzer(300);
+  returnToDefaultTargetTemperatureDisplay();
+}
+
+void cycleFiveButtonMenuFeature() {
+  /*
+    From the normal actual-temperature display, the first S4 press opens
+    the menu at Fan. Further S4 presses cycle through:
+      Fan -> Target Temperature -> Scent Pump -> Session Time -> Fan
+  */
+  if (!uiFiveButtonMenuActive) {
+    uiFiveButtonMenuActive = true;
+    uiFiveButtonMenuFeature = UI_MENU_FAN;
+    fanMenuActionDisplayActive = false;
+  } else {
+    switch (uiFiveButtonMenuFeature) {
+      case UI_MENU_FAN:
+        uiFiveButtonMenuFeature = UI_MENU_TARGET_TEMP;
+        fanMenuActionDisplayActive = false;
+        break;
+
+      case UI_MENU_TARGET_TEMP:
+        uiFiveButtonMenuFeature = UI_MENU_SCENT_PUMP;
+        fanMenuActionDisplayActive = false;
+        break;
+
+      case UI_MENU_SCENT_PUMP:
+        uiFiveButtonMenuFeature = UI_MENU_SESSION_TIME;
+        fanMenuActionDisplayActive = false;
+        break;
+
+      case UI_MENU_SESSION_TIME:
+      default:
+        uiFiveButtonMenuFeature = UI_MENU_FAN;
+        fanMenuActionDisplayActive = false;
+        break;
+    }
+  }
+
+  lastFiveButtonMenuKeyTime = millis();
+  resetSettingFeatureLedBlink();
+  uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+  showTempBlinking = false;
+  showFiveButtonMenuDisplay();
+}
+
+void enterStandbyModeFromS6() {
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  if (activeErrorCode != 0) {
+    return;
+  }
+
+  if (standbyDisabledByDip) {
+    setDisplayColonOnly();
+    return;
+  }
+
+  if (uiFiveButtonMenuDirty) {
+    saveFiveButtonMenuSettings();
+  }
+
+  drainDisplayActive = false;
+  cabinLightAdjustMode = false;
+  scentPumpAdjustMode = false;
+  uiSettingMode = UI_SETTING_NONE;
+  standbyTimeAdjustMode = false;
+  standbyTimeValueChanged = false;
+  uiFiveButtonMenuFeature = UI_MENU_FAN;
+  uiFiveButtonMenuActive = false;
+  fanMenuActionDisplayActive = false;
+
+  uiOperationMode = UI_MODE_STANDBY;
+
+  if (maxStandbyTimeMinFromDip == SESSION_TIME_UNLIMITED && selectedStandbyTimeMin >= SESSION_TIME_24H_MIN) {
+    remainingStandbyTimeSec = COUNTDOWN_UNLIMITED_SECONDS;
+  } else {
+    remainingStandbyTimeSec = (uint32_t)selectedStandbyTimeMin * 60UL;
+  }
+
+  lastLocalCountdownTickTime = millis();
+
+  sendOperationModeToPowerController(1);
+  startStandbyIntroFlash();
+  triggerBuzzer(100);
+}
+
+void enterSessionModeFromS6() {
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  drainDisplayActive = false;
+  cabinLightAdjustMode = false;
+  scentPumpAdjustMode = false;
+  uiSettingMode = UI_SETTING_NONE;
+  standbyTimeAdjustMode = false;
+  standbyTimeValueChanged = false;
+  stopStandbyIntroFlash();
+
+  uiOperationMode = UI_MODE_SESSION;
+  uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+  uiFiveButtonMenuFeature = UI_MENU_FAN;
+  uiFiveButtonMenuActive = false;
+  fanMenuActionDisplayActive = false;
+
+  sendOperationModeToPowerController(0);
+  triggerBuzzer(100);
+  returnToDefaultTargetTemperatureDisplay();
+}
+
+void enterOffStateFromS6() {
+  sendPowerOffCommand();
+
+  /*
+    Manual error reset:
+      Holding S6 for 2 seconds while the error is displayed returns the UI to
+      OFF state. This is the only user action that resets/hides a latched
+      error display.
+
+    If the physical fault is still present, the Power Controller will report
+    the error again and it will be stored while the UI is OFF. Pressing S6
+    again will display it again.
+
+    The UI clears the local visible error here because the user has performed
+    the required manual reset action.
+  */
+  activeErrorCode = 0;
+  errorLightAutoApplied = false;
+  localE11Active = false;
+  errorDisplayActive = false;
+  errorBlinkVisible = true;
+
+  uiMainState = UI_MAIN_OFF;
+  uiOperationMode = UI_MODE_SESSION;
+  uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+
+  uiFiveButtonMenuFeature = UI_MENU_FAN;
+  uiFiveButtonMenuDirty = false;
+  uiFiveButtonMenuActive = false;
+  fanMenuActionDisplayActive = false;
+
+  standbyTimeAdjustMode = false;
+  standbyTimeValueChanged = false;
+  cabinLightAdjustMode = false;
+  scentPumpAdjustMode = false;
+  uiSettingMode = UI_SETTING_NONE;
+  drainDisplayActive = false;
+  showTempBlinking = false;
+
+  stopStandbyIntroFlash();
+
+  setDisplayColonOnly();
+  indicatorMask = 0;
+}
+
+void updateFiveButtonPowerLogic() {
+  /*
+    New 5-button S6 behavior:
+
+      OFF state:
+        short S6 = request ON
+
+      ON Session / ON Standby:
+        short S6 = toggle Session <-> Standby
+        hold  S6 = request OFF
+
+      ERROR state:
+        short S6 = ignored
+        hold  S6 = manual error reset / request OFF
+
+    Critical safety rule:
+      A Power Controller "error = 0" report must not automatically clear the
+      displayed error. The displayed error is cleared only by S6 long press.
+  */
+
+  if (uiMainState == UI_MAIN_STARTUP) {
+    return;
+  }
+
+  if (consumeS6LongPressAction()) {
+    clearS5S7AdjustmentEvents();
+    startS6SharedButtonGuard();
+
+    if ((errorDisplayActive && activeErrorCode != 0) ||
+        uiMainState == UI_MAIN_ERROR ||
+        uiMainState == UI_MAIN_ON ||
+        uiMainState == UI_MAIN_POWER_ON_PENDING) {
+      enterOffStateFromS6();
+    }
+
+    return;
+  }
+
+  if (!s6ShortPressEvent) {
+    return;
+  }
+
+  s6ShortPressEvent = false;
+  clearS5S7AdjustmentEvents();
+  startS6SharedButtonGuard();
+
+  /*
+    If the error is already being displayed, a short S6 press must do nothing.
+    This prevents accidental ON re-requests while the unit is in Error State.
+  */
+  if (errorDisplayActive && activeErrorCode != 0) {
+    return;
+  }
+
+  /*
+    Stored error while UI is OFF:
+      Short S6 means the user is attempting to turn ON.
+      Send ON request so the Power Controller can apply its error behavior
+      such as forcing the cabin light ON, then display the latched error.
+  */
+  if (activeErrorCode != 0 && uiMainState == UI_MAIN_OFF) {
+    sendPowerOnCommand();
+    activateErrorDisplayNow(activeErrorCode);
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_OFF) {
+    uiMainState = UI_MAIN_POWER_ON_PENDING;
+
+    setDisplayBlank();
+    indicatorMask = 0;
+
+    sendPowerOnCommand();
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_POWER_ON_PENDING || uiMainState == UI_MAIN_ERROR) {
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_ON) {
+    if (uiOperationMode == UI_MODE_STANDBY) {
+      enterSessionModeFromS6();
+    } else {
+      enterStandbyModeFromS6();
+    }
+  }
+}
+
+void updateFiveButtonCabinLightLogic() {
+  /*
+    New S3 behavior:
+      S3 short press = Cabin Light ON/OFF.
+      If DIP8 dimmer is enabled, S5/S7 can adjust brightness after turning ON.
+  */
+
+  if (uiMainState == UI_MAIN_STARTUP) {
+    return;
+  }
+
+  if (!s3ShortPressEvent) {
+    return;
+  }
+
+  s3ShortPressEvent = false;
+  s3LongPressEvent = false;
+
+  if (cabinLightOn) {
+    cabinLightOn = false;
+    cabinLightAdjustMode = false;
+    cabinLightWaitingForStatusAfterKey = false;
+
+    indicatorMask &= ~LED_CABIN_LIGHT;
+
+    sendCabinLightSetPoint(0);
+    returnToDefaultTargetTemperatureDisplay();
+    return;
+  }
+
+  cabinLightOn = true;
+
+  if (cabinLightSetPointPercent == 0) {
+    cabinLightSetPointPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+  }
+
+  cancelOtherTemporaryDisplaysForCabinLight();
+
+  cabinLightAdjustMode = false;
+  cabinLightWaitingForStatusAfterKey = true;
+
+  indicatorMask |= LED_CABIN_LIGHT;
+
+  sendCabinLightSetPoint(cabinLightSetPointPercent);
+}
+
+void updateFiveButtonMenuLogic() {
+  /*
+    New 5-button behavior.
+
+    Session mode:
+      S4 cycles:
+        Fan -> Target Temperature -> Scent Pump -> Session Time -> Fan
+
+      S5/S7 adjust the selected feature.
+
+      Save:
+        - no key for 5 seconds after a value change
+        - or hold S4 for 2 seconds
+
+    Standby mode:
+      S5/S7 adjust Standby Time.
+      no key for 5 seconds saves Standby Time.
+      hold S4 for 5 seconds starts Force Drain.
+  */
+
+  if (uiMainState != UI_MAIN_ON || activeErrorCode != 0) {
+    uiFiveButtonMenuDirty = false;
+    uiFiveButtonMenuActive = false;
+    standbyTimeAdjustMode = false;
+    return;
+  }
+
+  if (drainDisplayActive || cabinLightAdjustMode) {
+    return;
+  }
+
+  /*
+    Standby mode:
+      - S4 short press is ignored because S6 handles Standby <-> Session.
+      - S5/S7 adjust Standby Time.
+      - S4 5-second hold starts Force Drain.
+  */
+  if (uiOperationMode == UI_MODE_STANDBY) {
+    if (s4ShortPressEvent) {
+      s4ShortPressEvent = false;
+    }
+
+    if (s4LongPressEvent) {
+      s4LongPressEvent = false;
+
+      /*
+        If the user changed Standby Time before Force Drain,
+        save the new value first.
+      */
+      saveStandbyTimeIfChanged();
+      standbyTimeAdjustMode = false;
+      standbyTimeValueChanged = false;
+
+      stopStandbyIntroFlash();
+      drainDisplayActive = false;
+      sendDrainFillStartToPowerController();
+      return;
+    }
+
+    if (standbyDisabledByDip) {
+      updateStandbyModeDisplay();
+      return;
+    }
+
+    bool standbyAdjustmentAction = false;
+    bool standbyValueChanged = false;
+    bool standbyLimitReached = false;
+
+    if (consumeS5DecreaseAction()) {
+      standbyAdjustmentAction = true;
+
+      if (selectedStandbyTimeMin > SESSION_TIME_MIN_MIN) {
+        selectedStandbyTimeMin -= SESSION_TIME_STEP_MIN;
+
+        if (selectedStandbyTimeMin < SESSION_TIME_MIN_MIN) {
+          selectedStandbyTimeMin = SESSION_TIME_MIN_MIN;
+        }
+
+        standbyValueChanged = true;
+      } else {
+        standbyLimitReached = true;
+      }
+    }
+
+    if (consumeS7IncreaseAction()) {
+      standbyAdjustmentAction = true;
+
+      uint16_t maxStandby = maxStandbyTimeMinFromDip;
+
+      if (maxStandby == SESSION_TIME_UNLIMITED) {
+        maxStandby = SESSION_TIME_24H_MIN;
+      }
+
+      if (selectedStandbyTimeMin < maxStandby) {
+        selectedStandbyTimeMin += SESSION_TIME_STEP_MIN;
+
+        if (selectedStandbyTimeMin > maxStandby) {
+          selectedStandbyTimeMin = maxStandby;
+        }
+
+        standbyValueChanged = true;
+      } else {
+        standbyLimitReached = true;
+      }
+    }
+
+    if (standbyAdjustmentAction) {
+      standbyTimeAdjustMode = true;
+      lastStandbyKeyTime = millis();
+      stopStandbyIntroFlash();
+
+      if (standbyValueChanged) {
+        standbyTimeValueChanged = true;
+
+        if (maxStandbyTimeMinFromDip == SESSION_TIME_UNLIMITED && selectedStandbyTimeMin >= SESSION_TIME_24H_MIN) {
+          remainingStandbyTimeSec = COUNTDOWN_UNLIMITED_SECONDS;
+        } else {
+          remainingStandbyTimeSec = (uint32_t)selectedStandbyTimeMin * 60UL;
+        }
+
+        lastLocalCountdownTickTime = millis();
+        updateStandbyModeDisplay();
+      } else if (standbyLimitReached) {
+        if (s7StablePressed) {
+          fastBeeping();
+        } else if (s5StablePressed) {
+          fastBeeping2();
+        } else {
+          triggerBuzzer(75);
+        }
+        updateStandbyModeDisplay();
+      }
+    }
+
+    if (standbyTimeAdjustMode && ((millis() - lastStandbyKeyTime) >= SETTINGS_TIMEOUT_MS)) {
+      saveStandbyTimeIfChanged();
+      standbyTimeAdjustMode = false;
+      standbyTimeValueChanged = false;
+      updateStandbyModeDisplay();
+      return;
+    }
+
+    updateStandbyModeDisplay();
+    return;
+  }
+
+  if (uiOperationMode != UI_MODE_SESSION) {
+    return;
+  }
+
+  /*
+    During the 5-second ON intro, target temperature blinking owns the display.
+    The S4 menu is not allowed to overwrite it.
+  */
+  if (showTempBlinking) {
+    s4ShortPressEvent = false;
+    s4LongPressEvent = false;
+    s5PressEvent = false;
+    s7PressEvent = false;
+    return;
+  }
+
+  /*
+    Normal Session default display is actual cabin temperature.
+    Until S4 opens the menu, S5/S7 are ignored so they cannot adjust a hidden
+    target-temperature value while actual temperature is displayed.
+  */
+  if (!uiFiveButtonMenuActive) {
+    if (s4ShortPressEvent) {
+      s4ShortPressEvent = false;
+      cycleFiveButtonMenuFeature();
+      return;
+    }
+
+    if (s4LongPressEvent) {
+      s4LongPressEvent = false;
+      return;
+    }
+
+    s5PressEvent = false;
+    s7PressEvent = false;
+    showDefaultActualTemperatureDisplay();
+    return;
+  }
+
+  if (s4LongPressEvent) {
+    s4LongPressEvent = false;
+    saveFiveButtonMenuSettings();
+    return;
+  }
+
+  if (s4ShortPressEvent) {
+    s4ShortPressEvent = false;
+    cycleFiveButtonMenuFeature();
+    return;
+  }
+
+  bool adjustmentAction = false;
+  bool valueChanged = false;
+  bool limitReached = false;
+
+  if (consumeS5DecreaseAction()) {
+    adjustmentAction = true;
+
+    switch (uiFiveButtonMenuFeature) {
+      case UI_MENU_TARGET_TEMP:
+        if (temperatureSetPointC > TARGET_TEMP_MIN_C) {
+          temperatureSetPointC--;
+          valueChanged = true;
+        } else {
+          limitReached = true;
+        }
+        break;
+
+      case UI_MENU_FAN:
+        fanMenuActionDisplayActive = true;
+        if (fanRequestedOn) {
+          fanRequestedOn = false;
+          valueChanged = true;
+          sendFanControlToPowerController(fanRequestedOn);
+        } else {
+          /*
+            Fan is already OFF, but S5 must still show OFF on the display.
+          */
+          showFiveButtonMenuDisplay();
+        }
+        break;
+
+      case UI_MENU_SCENT_PUMP:
+        if (scentPumpSetPoint > SCENT_PUMP_MIN_SETPOINT) {
+          scentPumpSetPoint--;
+          valueChanged = true;
+        } else {
+          limitReached = true;
+        }
+        break;
+
+      case UI_MENU_SESSION_TIME:
+        if (selectedSessionTimeMin > SESSION_TIME_MIN_MIN) {
+          selectedSessionTimeMin -= SESSION_TIME_STEP_MIN;
+          if (selectedSessionTimeMin < SESSION_TIME_MIN_MIN) {
+            selectedSessionTimeMin = SESSION_TIME_MIN_MIN;
+          }
+          valueChanged = true;
+        } else {
+          limitReached = true;
+        }
+        break;
+    }
+  }
+
+  if (consumeS7IncreaseAction()) {
+    adjustmentAction = true;
+
+    switch (uiFiveButtonMenuFeature) {
+      case UI_MENU_TARGET_TEMP:
+        if (temperatureSetPointC < maxTargetTemperatureC) {
+          temperatureSetPointC++;
+          valueChanged = true;
+        } else {
+          limitReached = true;
+        }
+        break;
+
+      case UI_MENU_FAN:
+        fanMenuActionDisplayActive = true;
+        if (!fanRequestedOn) {
+          fanRequestedOn = true;
+          valueChanged = true;
+          sendFanControlToPowerController(fanRequestedOn);
+        } else {
+          /*
+            Fan is already ON, but S7 must still show ON on the display.
+          */
+          showFiveButtonMenuDisplay();
+        }
+        break;
+
+      case UI_MENU_SCENT_PUMP:
+        if (scentPumpSetPoint < SCENT_PUMP_MAX_SETPOINT) {
+          scentPumpSetPoint++;
+          valueChanged = true;
+        } else {
+          limitReached = true;
+        }
+        break;
+
+      case UI_MENU_SESSION_TIME:
+        if (selectedSessionTimeMin < maxSessionTimeMinFromDip) {
+          selectedSessionTimeMin += SESSION_TIME_STEP_MIN;
+          if (selectedSessionTimeMin > maxSessionTimeMinFromDip) {
+            selectedSessionTimeMin = maxSessionTimeMinFromDip;
+          }
+          valueChanged = true;
+        } else {
+          limitReached = true;
+        }
+        break;
+    }
+  }
+
+  if (adjustmentAction) {
+    if (valueChanged) {
+      markFiveButtonMenuChanged();
+      showFiveButtonMenuDisplay();
+    } else if (limitReached) {
+      if (s7StablePressed) {
+        fastBeeping();
+      } else if (s5StablePressed) {
+        fastBeeping2();
+      } else {
+        triggerBuzzer(75);
+      }
+      showFiveButtonMenuDisplay();
+    }
+  }
+
+  if (uiFiveButtonMenuDirty && ((millis() - lastFiveButtonMenuKeyTime) >= SETTINGS_TIMEOUT_MS)) {
+    saveFiveButtonMenuSettings();
+    return;
+  }
+
+  if (uiFiveButtonMenuActive && !uiFiveButtonMenuDirty && ((millis() - lastFiveButtonMenuKeyTime) >= SETTINGS_TIMEOUT_MS)) {
+    uiFiveButtonMenuActive = false;
+    uiFiveButtonMenuFeature = UI_MENU_FAN;
+    fanMenuActionDisplayActive = false;
+    showDefaultActualTemperatureDisplay();
+    return;
+  }
+
+  /*
+    Keep the selected feature visible so no normal display function can overwrite it.
+  */
+  showFiveButtonMenuDisplay();
+}
+
+// ======================================================
+// S1 ON/OFF LOGIC
+// ======================================================
+
+void updateOnOffButtonLogic() {
+  if (uiMainState == UI_MAIN_STARTUP) {
+    return;
+  }
+
+  if (!s1PressEvent) {
+    return;
+  }
+
+  s1PressEvent = false;
+
+  /*
+    If an error was received/stored while the UI was OFF,
+    pressing S1 must not enter normal ON mode.
+    It activates the flashing error display instead.
+  */
+  if (activeErrorCode != 0) {
+    activateErrorDisplayNow(activeErrorCode);
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_OFF) {
+    uiMainState = UI_MAIN_POWER_ON_PENDING;
+
+    setDisplayBlank();
+    indicatorMask = 0;
+
+    sendPowerOnCommand();
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_POWER_ON_PENDING) {
+    /*
+      Ignore repeated S1 press while waiting for Power Controller ACK.
+    */
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_ON) {
+    sendPowerOffCommand();
+
+    uiMainState = UI_MAIN_OFF;
+    uiOperationMode = UI_MODE_SESSION;
+    standbyTimeAdjustMode = false;
+    standbyTimeValueChanged = false;
+    showTempBlinking = false;
+
+    setDisplayColonOnly();
+    indicatorMask = 0;
+
+    return;
+  }
+}
+
+void updateCabinLightButtonLogic() {
+  /*
+    S2 Cabin Light behavior:
+
+    DIP8 OFF:
+      S2 toggles cabin light ON/OFF only.
+      No setpoint display.
+
+    DIP8 ON:
+      S2 turns cabin light ON and waits for Power Controller status.
+      If Power Controller confirms dimmer mode, UI displays 100.
+  */
+
+  if (uiMainState == UI_MAIN_STARTUP) {
+    return;
+  }
+
+  if (!s2PressEvent) {
+    return;
+  }
+
+  s2PressEvent = false;
+
+  if (cabinLightOn) {
+    cabinLightOn = false;
+
+    /*
+    Do not set cabinLightSetPointPercent to 0 here.
+    OFF should not erase the saved dimmer level.
+    Example:
+      saved level = 60%
+      S2 OFF      = light OFF
+      S2 ON again = returns to 60%
+  */
+    cabinLightAdjustMode = false;
+    cabinLightWaitingForStatusAfterKey = false;
+
+    indicatorMask &= ~LED_CABIN_LIGHT;
+
+    sendCabinLightSetPoint(0);
+    restoreNormalDisplayAfterCabinLight();
+
+    return;
+  }
+
+  /*
+    Turn light ON.
+    Do not display 100 yet.
+    Wait for the Power Controller status to tell us if DIP8 dimmer is enabled.
+  */
+  cancelOtherTemporaryDisplaysForCabinLight();
+
+  cabinLightOn = true;
+
+  if (cabinLightSetPointPercent == 0) {
+    cabinLightSetPointPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+  }
+
+  cabinLightAdjustMode = false;
+  cabinLightWaitingForStatusAfterKey = true;
+
+  indicatorMask |= LED_CABIN_LIGHT;
+
+  sendCabinLightSetPoint(cabinLightSetPointPercent);
+}
+
+void setDisplayCabinLightPercent(uint8_t percent) {
+  /*
+    Displays:
+      100 -> " 100"
+       95 -> "  95"
+        5 -> "   5"
+        0 -> "   0"
+  */
+
+  if (percent > 100) {
+    percent = 100;
+  }
+
+  displayDecimalPoint[0] = false;
+  displayDecimalPoint[1] = false;
+  displayDecimalPoint[2] = false;
+  displayDecimalPoint[3] = false;
+
+  if (percent >= 100) {
+    displayChars[0] = ' ';
+    displayChars[1] = '1';
+    displayChars[2] = '0';
+    displayChars[3] = '0';
+  } else if (percent >= 10) {
+    displayChars[0] = ' ';
+    displayChars[1] = ' ';
+    displayChars[2] = '0' + (percent / 10);
+    displayChars[3] = '0' + (percent % 10);
+  } else {
+    displayChars[0] = ' ';
+    displayChars[1] = ' ';
+    displayChars[2] = ' ';
+    displayChars[3] = '0' + percent;
+  }
+}
+
+
+// ======================================================
+// DISPLAY OWNER / DISPLAY BLOCK HELPERS
+// ======================================================
+
+bool normalDisplayIsBlocked() {
+  /*
+    Normal Target Temperature / Session Time display must not overwrite
+    temporary setting displays.
+  */
+
+  if (errorDisplayActive && activeErrorCode != 0) {
+    return true;
+  }
+
+  if (drainDisplayActive) {
+    return true;
+  }
+
+  if (cabinLightAdjustMode) {
+    return true;
+  }
+
+  if (scentPumpAdjustMode) {
+    return true;
+  }
+
+  if (standbyTimeAdjustMode) {
+    return true;
+  }
+
+  if (uiSettingMode != UI_SETTING_NONE) {
+    return true;
+  }
+
+  /*
+    The 5-button menu owns the display only while the user is actively
+    viewing/editing a menu feature. The normal default Session display is
+    actual cabin temperature.
+  */
+  if (uiFiveButtonMenuActive) {
+    return true;
+  }
+
+  return false;
+}
+
+void showDefaultActualTemperatureDisplay() {
+  if (uiMainState != UI_MAIN_ON || uiOperationMode != UI_MODE_SESSION) {
+    return;
+  }
+
+  if (errorDisplayActive && activeErrorCode != 0) {
+    return;
+  }
+
+  if (drainDisplayActive || cabinLightAdjustMode || scentPumpAdjustMode ||
+      standbyTimeAdjustMode || uiSettingMode != UI_SETTING_NONE ||
+      uiFiveButtonMenuActive || showTempBlinking) {
+    return;
+  }
+
+  indicatorMask &= ~(LED_SESSION | LED_STANDBY | LED_FAN | LED_SCENT);
+  indicatorMask |= LED_ON | LED_TEMP;
+
+  if (currentActualTemperatureValid) {
+    setDisplayActualTemperatureC(currentActualTemperatureC);
+  } else {
+    setDisplayActualTemperatureUnavailable();
+  }
+}
+
+void returnToDefaultTargetTemperatureDisplay() {
+  /*
+    Default display after any temporary setting is completed:
+      Actual cabin temperature.
+
+    Target temperature is shown only during the 5-second ON intro blink
+    or while the S4 5-button menu is active.
+  */
+
+  if (errorDisplayActive && activeErrorCode != 0) {
+    setDisplayError(activeErrorCode);
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_OFF) {
+    setDisplayColonOnly();
+    return;
+  }
+
+  if (drainDisplayActive) {
+    updateDrainModeDisplay();
+    return;
+  }
+
+  if (uiMainState == UI_MAIN_ON) {
+    /*
+      If the system is in Standby, restoring a temporary display must not
+      force the system back to Session mode. Keep Standby visible.
+    */
+    if (uiOperationMode == UI_MODE_STANDBY) {
+      updateStandbyModeDisplay();
+      return;
+    }
+
+    uiOperationMode = UI_MODE_SESSION;
+    uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+    uiFiveButtonMenuFeature = UI_MENU_FAN;
+    uiFiveButtonMenuActive = false;
+
+    showTempBlinking = false;
+    tempBlinkVisible = true;
+
+    showDefaultActualTemperatureDisplay();
+    return;
+  }
+
+  setDisplayColonOnly();
+}
+
+void cancelOtherTemporaryDisplaysForScentPump() {
+  /*
+    Scent Pump display gets display ownership while it is being adjusted.
+    Other temporary displays must not refresh over it.
+  */
+
+  uiSettingMode = UI_SETTING_NONE;
+  cabinLightAdjustMode = false;
+  cabinLightWaitingForStatusAfterKey = false;
+  standbyTimeAdjustMode = false;
+  standbyTimeValueChanged = false;
+  showTempBlinking = false;
+}
+
+void cancelOtherTemporaryDisplaysForCabinLight() {
+  /*
+    Cabin Light dimming display gets display ownership while it is being adjusted.
+  */
+
+  uiSettingMode = UI_SETTING_NONE;
+  scentPumpAdjustMode = false;
+  standbyTimeAdjustMode = false;
+  standbyTimeValueChanged = false;
+  showTempBlinking = false;
+}
+
+void restoreNormalDisplayAfterCabinLight() {
+  returnToDefaultTargetTemperatureDisplay();
+}
+
+void restoreNormalDisplayAfterScentPump() {
+  returnToDefaultTargetTemperatureDisplay();
+}
+
+void updateCabinLightAdjustMode() {
+  if (!cabinLightAdjustMode) {
+    return;
+  }
+
+  if (uiSettingMode != UI_SETTING_NONE) {
+    return;
+  }
+  if (!cabinLightDimmerEnabled) {
+    cabinLightAdjustMode = false;
+    cabinLightWaitingForStatusAfterKey = false;
+    restoreNormalDisplayAfterCabinLight();
+    return;
+  }
+  if (activeErrorCode != 0) {
+    cabinLightAdjustMode = false;
+    cabinLightWaitingForStatusAfterKey = false;
+    return;
+  }
+
+  /*
+    While cabin light adjustment is active, this display owns the screen.
+  */
+  setDisplayCabinLightPercent(cabinLightSetPointPercent);
+
+  bool valueChanged = false;
+  bool limitReached = false;
+
+  /*
+    S5 = decrease brightness.
+    Holding S5 repeats faster.
+  */
+  if (consumeS5DecreaseAction()) {
+    if (cabinLightSetPointPercent >= 5) {
+      cabinLightSetPointPercent -= 5;
+      valueChanged = true;
+    } else {
+      cabinLightSetPointPercent = 0;
+      limitReached = true;
+    }
+  }
+
+  /*
+    S7 = increase brightness.
+    Holding S7 repeats faster.
+  */
+  if (consumeS7IncreaseAction()) {
+    if (cabinLightSetPointPercent <= 95) {
+      cabinLightSetPointPercent += 5;
+      valueChanged = true;
+    } else {
+      cabinLightSetPointPercent = 100;
+      limitReached = true;
+    }
+  }
+
+  if (limitReached) {
+    if (s7StablePressed) {
+      fastBeeping();
+    } else if (s5StablePressed) {
+      fastBeeping2();
+    } else {
+      triggerBuzzer(75);
+    }
+  }
+
+  if (valueChanged) {
+    lastCabinLightKeyTime = millis();
+
+    if (cabinLightSetPointPercent == 0) {
+      cabinLightOn = false;
+      indicatorMask &= ~LED_CABIN_LIGHT;
+    } else {
+      cabinLightOn = true;
+      indicatorMask |= LED_CABIN_LIGHT;
+    }
+
+    setDisplayCabinLightPercent(cabinLightSetPointPercent);
+    sendCabinLightSetPoint(cabinLightSetPointPercent);
+  }
+
+  if ((millis() - lastCabinLightKeyTime) >= CABIN_LIGHT_ADJUST_TIMEOUT_MS) {
+    cabinLightAdjustMode = false;
+
+    /*
+    Save cabin light dimmer percentage to EEPROM.
+    This makes the adjusted dimming level become the next default.
+  */
+    saveSettingsToEEPROM();
+    triggerBuzzer(300);
+    restoreNormalDisplayAfterCabinLight();
+  }
+}
+
+
+// ======================================================
+// NORMAL SESSION DISPLAY LOGIC
+// ======================================================
+
+void updateNormalSessionDisplay() {
+  /*
+    Normal ON/session display.
+
+    This function is allowed to write to the display only when no temporary
+    display owner is active.
+  */
+
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  if (uiOperationMode != UI_MODE_SESSION) {
+    return;
+  }
+
+  if (normalDisplayIsBlocked()) {
+    return;
+  }
+
+  indicatorMask &= ~(LED_TEMP | LED_SESSION | LED_STANDBY);
+  indicatorMask |= LED_ON;
+
+  if (uiNormalDisplayMode == UI_NORMAL_DISPLAY_SESSION_TIME) {
+    indicatorMask |= LED_SESSION;
+    setDisplayCountdownSeconds(remainingSessionTimeSec);
+  } else {
+    indicatorMask |= LED_TEMP;
+    if (currentActualTemperatureValid) {
+      setDisplayActualTemperatureC(currentActualTemperatureC);
+    } else {
+      setDisplayActualTemperatureUnavailable();
+    }
+  }
+}
+
+void updateS6NormalDisplayToggle() {
+  /*
+    S6 short press now enters setting mode immediately.
+
+    Removed:
+      3-second hold to enter setting mode.
+
+    New behavior:
+      - Normal ON/session display:
+          Short S6 = enter setting mode for the currently displayed item.
+      - While already in setting mode:
+          Short S6 = toggle Target Temperature / Session Time.
+  */
+
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  if (activeErrorCode != 0) {
+    return;
+  }
+
+  if (uiOperationMode != UI_MODE_SESSION) {
+    return;
+  }
+
+  if (uiSettingMode != UI_SETTING_NONE) {
+    return;
+  }
+
+  if (!s6ShortPressEvent) {
+    return;
+  }
+
+  s6ShortPressEvent = false;
+  clearS5S7AdjustmentEvents();
+  startS6SharedButtonGuard();
+
+  enterSettingMode();
+}
+
+// ======================================================
+// TARGET TEMPERATURE AND SESSION TIME SETTING LOGIC
+// ======================================================
+
+void updateSettingModeDisplay() {
+  indicatorMask &= ~(LED_TEMP | LED_SESSION | LED_STANDBY);
+
+  if (uiMainState == UI_MAIN_ON) {
+    indicatorMask |= LED_ON;
+  }
+
+  if (uiOperationMode == UI_MODE_STANDBY) {
+    indicatorMask |= LED_STANDBY;
+  }
+
+  if (uiSettingMode == UI_SETTING_TEMPERATURE) {
+    indicatorMask |= LED_TEMP;
+    setDisplayTemperatureSetPoint(temperatureSetPointC);
+  } else if (uiSettingMode == UI_SETTING_SESSION_TIME) {
+    indicatorMask |= LED_SESSION;
+    setDisplaySessionTime(selectedSessionTimeMin);
+  }
+}
+
+
+void enterSettingMode() {
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  if (activeErrorCode != 0) {
+    return;
+  }
+
+  cabinLightAdjustMode = false;
+  standbyTimeAdjustMode = false;
+
+  /*
+    Short press S6 enters adjustment mode for the
+    item currently shown in normal ON/session display:
+
+      Target Temperature display -> Target Temperature adjustment
+      Session Time display       -> Session Time adjustment
+  */
+  if (uiOperationMode == UI_MODE_SESSION && uiNormalDisplayMode == UI_NORMAL_DISPLAY_SESSION_TIME) {
+    uiSettingMode = UI_SETTING_SESSION_TIME;
+  } else {
+    uiSettingMode = UI_SETTING_TEMPERATURE;
+  }
+
+  lastSettingKeyTime = millis();
+
+  updateSettingModeDisplay();
+}
+
+void applySavedSettingToLocalDisplay(uint8_t savedSettingMode) {
+  /*
+    After saving a setting, update the local UI display values immediately.
+
+    Important:
+      savedSettingMode is passed in because saveAndExitSettingMode()
+      will clear uiSettingMode when exiting setting mode.
+
+    Fix:
+      If the user saves Session Time, immediately reload
+      remainingSessionTimeSec from selectedSessionTimeMin so the display
+      shows the saved value instead of the old countdown value.
+  */
+
+  if (savedSettingMode == UI_SETTING_TEMPERATURE) {
+    uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+    setDisplayTemperatureSetPoint(temperatureSetPointC);
+    return;
+  }
+
+  if (savedSettingMode == UI_SETTING_SESSION_TIME) {
+    uiNormalDisplayMode = UI_NORMAL_DISPLAY_SESSION_TIME;
+
+    if (selectedSessionTimeMin == SESSION_TIME_UNLIMITED) {
+      remainingSessionTimeSec = COUNTDOWN_UNLIMITED_SECONDS;
+    } else {
+      remainingSessionTimeSec = (uint32_t)selectedSessionTimeMin * 60UL;
+    }
+
+    lastLocalCountdownTickTime = millis();
+    setDisplayCountdownSeconds(remainingSessionTimeSec);
+    return;
+  }
+}
+
+void saveAndExitSettingMode() {
+  if (uiSettingMode == UI_SETTING_NONE) {
+    return;
+  }
+
+  /*
+    Remember what the user is saving before clearing setting mode.
+  */
+  uint8_t savedSettingMode = uiSettingMode;
+
+  sendUiSettingsToPowerController();
+  saveSettingsToEEPROM();
+  /*
+    If Session Time is saved, reset the local countdown value immediately.
+    This keeps EEPROM, selected value, and the local countdown synchronized.
+  */
+  if (savedSettingMode == UI_SETTING_SESSION_TIME) {
+    if (selectedSessionTimeMin == SESSION_TIME_UNLIMITED) {
+      remainingSessionTimeSec = COUNTDOWN_UNLIMITED_SECONDS;
+    } else {
+      remainingSessionTimeSec = (uint32_t)selectedSessionTimeMin * 60UL;
+    }
+
+    lastLocalCountdownTickTime = millis();
+  }
+
+  /*
+    Exit setting mode, then return to the default display.
+  */
+  uiSettingMode = UI_SETTING_NONE;
+
+  triggerBuzzer(300);
+  returnToDefaultTargetTemperatureDisplay();
+
+}
+
+void updateTemperatureAndSessionSettingLogic() {
+  if (activeErrorCode != 0) {
+    uiSettingMode = UI_SETTING_NONE;
+    return;
+  }
+
+  if (consumeS6LongPressAction()) {
+    clearS5S7AdjustmentEvents();
+    startS6SharedButtonGuard();
+
+    /*
+      S6 long press while Standby Time is displayed/adjusted:
+        save Standby Time using a 3-second hold.
+
+      Keep this before Target/Session save so the S6 event is not consumed
+      by the wrong setting mode.
+    */
+    if (uiOperationMode == UI_MODE_STANDBY && standbyTimeAdjustMode) {
+      saveStandbyTimeIfChanged();
+      standbyTimeAdjustMode = false;
+      standbyTimeValueChanged = false;
+      updateStandbyModeDisplay();
+      return;
+    }
+
+    /*
+      S6 long press is save-only for Target Temperature / Session Time.
+      It no longer enters setting mode from normal display.
+    */
+    if (uiSettingMode != UI_SETTING_NONE) {
+      saveAndExitSettingMode();
+    }
+
+    return;
+  }
+
+  if (uiSettingMode == UI_SETTING_NONE) {
+    return;
+  }
+
+  bool adjustmentAction = false;
+  bool valueChanged = false;
+  bool limitReached = false;
+
+  if (s6ShortPressEvent) {
+    s6ShortPressEvent = false;
+    clearS5S7AdjustmentEvents();
+    startS6SharedButtonGuard();
+
+    if (uiSettingMode == UI_SETTING_TEMPERATURE) {
+      uiSettingMode = UI_SETTING_SESSION_TIME;
+    } else {
+      uiSettingMode = UI_SETTING_TEMPERATURE;
+    }
+
+    lastSettingKeyTime = millis();
+    updateSettingModeDisplay();
+    return;
+  }
+
+  if (consumeS5DecreaseAction()) {
+    adjustmentAction = true;
+
+    if (uiSettingMode == UI_SETTING_TEMPERATURE) {
+      if (temperatureSetPointC > TARGET_TEMP_MIN_C) {
+        temperatureSetPointC--;
+        valueChanged = true;
+      } else {
+        limitReached = true;
+      }
+    } else if (uiSettingMode == UI_SETTING_SESSION_TIME) {
+      if (selectedSessionTimeMin > SESSION_TIME_MIN_MIN) {
+        selectedSessionTimeMin -= SESSION_TIME_STEP_MIN;
+
+        if (selectedSessionTimeMin < SESSION_TIME_MIN_MIN) {
+          selectedSessionTimeMin = SESSION_TIME_MIN_MIN;
+        }
+
+        valueChanged = true;
+      } else {
+        limitReached = true;
+      }
+    }
+  }
+
+  if (consumeS7IncreaseAction()) {
+    adjustmentAction = true;
+
+    if (uiSettingMode == UI_SETTING_TEMPERATURE) {
+      if (temperatureSetPointC < maxTargetTemperatureC) {
+        temperatureSetPointC++;
+        valueChanged = true;
+      } else {
+        limitReached = true;
+      }
+    } else if (uiSettingMode == UI_SETTING_SESSION_TIME) {
+      uint16_t maxSession = maxSessionTimeMinFromDip;
+
+      if (maxSession == SESSION_TIME_UNLIMITED) {
+        maxSession = SESSION_TIME_24H_MIN;
+      }
+
+      if (selectedSessionTimeMin < maxSession) {
+        selectedSessionTimeMin += SESSION_TIME_STEP_MIN;
+
+        if (selectedSessionTimeMin > maxSession) {
+          selectedSessionTimeMin = maxSession;
+        }
+
+        valueChanged = true;
+      } else {
+        limitReached = true;
+      }
+    }
+  }
+
+  if (adjustmentAction) {
+    lastSettingKeyTime = millis();
+
+    if (valueChanged) {
+      updateSettingModeDisplay();
+    } else if (limitReached) {
+      if (s7StablePressed) {
+        fastBeeping();
+      } else if (s5StablePressed) {
+        fastBeeping2();
+      } else {
+        triggerBuzzer(75);
+      }
+      updateSettingModeDisplay();
+    }
+  }
+  if ((millis() - lastSettingKeyTime) >= SETTINGS_TIMEOUT_MS) {
+    saveAndExitSettingMode();
+  }
+}
+
+
+// ======================================================
+// DRAIN DISPLAY LOGIC
+// ======================================================
+
+void updateDrainModeDisplay() {
+  if (startupState != UI_START_OFF) {
+    return;
+  }
+
+  if (!drainDisplayActive) {
+    return;
+  }
+
+  /*
+    Drain indicator rule:
+      During drain, no feature/status LED should be ON.
+      Only the Cabin Light LED is preserved because it is a separate
+      independent light-status indicator.
+
+      Therefore:
+        D5 / LED_ON      = OFF
+        D7 / LED_STANDBY = OFF
+        Temp/Session/Fan/Scent LEDs = OFF
+        Cabin Light LED = unchanged
+  */
+  indicatorMask &= LED_CABIN_LIGHT;
+
+  /*
+    Original-device drain display behavior:
+
+      Fill-to-level-1 preparation, pcDrainState = 1:
+        display "dr" steady.
+
+      Actual drain, pcDrainState = 2:
+        alternate "dr" and remaining drain time every second.
+  */
+  if (pcDrainState == 1) {
+    setDisplayText("dr  ");
+    return;
+  }
+
+  if (pcDrainState == 2) {
+    if (drainDisplayStep == 0) {
+      setDisplayText("dr  ");
+    } else {
+      setDisplayCountdownSeconds(remainingDrainTimeSec);
+    }
+
+    return;
+  }
+
+  setDisplayColonOnly();
+}
+
+void updateDrainDisplayFlash() {
+  if (startupState != UI_START_OFF) {
+    drainDisplayActive = false;
+    previousPcDrainState = 0;
+    drainDisplayStep = 0;
+    return;
+  }
+
+  if (!drainDisplayActive) {
+    return;
+  }
+
+  if (activeErrorCode != 0) {
+    drainDisplayActive = false;
+    return;
+  }
+
+  if (pcDrainState == 0) {
+    drainDisplayActive = false;
+    previousPcDrainState = 0;
+    drainDisplayStep = 0;
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (pcDrainState == 1) {
+    /*
+      Fill preparation: show "dr" steady.
+      Do not alternate during this stage.
+    */
+    drainDisplayStep = 0;
+    updateDrainModeDisplay();
+    return;
+  }
+
+  if (pcDrainState == 2) {
+    if ((now - lastDrainFlashToggleTime) >= DRAIN_DISPLAY_INTERVAL_MS) {
+      lastDrainFlashToggleTime = now;
+      drainDisplayStep++;
+      if (drainDisplayStep >= 2) {
+        drainDisplayStep = 0;
+      }
+    }
+
+    drainFlashShowWord = (drainDisplayStep == 0);
+    updateDrainModeDisplay();
+    return;
+  }
+}
+
+// ======================================================
+// S4 STANDBY MODE AND STANDBY TIME LOGIC
+// ======================================================
+
+void updateStandbyModeDisplay() {
+  if (drainDisplayActive) {
+    updateDrainModeDisplay();
+    return;
+  }
+
+  /*
+    Standby display behavior:
+
+      - While Standby countdown is 1 minute or higher, alternate STBY and time.
+      - Below 1 minute, show seconds continuously without STBY.
+      - While standby time is being adjusted, show the selected standby time.
+
+    The standby countdown display uses the same formatting rule as Session Time:
+      30 minutes -> 0:30
+      5 minutes  -> 0:05
+      50 seconds ->  50  with no colon
+  */
+
+  /*
+    Standby indicator rule:
+      In Standby mode, D7 / LED_STANDBY must be ON and
+      D5 / LED_ON must be OFF.
+
+    This prevents the UI from showing both ON and STANDBY indicators
+    at the same time.
+  */
+  indicatorMask &= ~(LED_ON | LED_TEMP | LED_SESSION | LED_FAN | LED_SCENT);
+
+  if (uiOperationMode == UI_MODE_STANDBY) {
+    indicatorMask |= LED_STANDBY;
+
+    if (standbyDisabledByDip) {
+      setDisplayColonOnly();
+      return;
+    }
+
+    if (standbyFlashActive && standbyFlashShowWord && !standbyTimeAdjustMode && remainingStandbyTimeSec != COUNTDOWN_UNLIMITED_SECONDS && remainingStandbyTimeSec >= 60UL) {
+      /*
+        Display the standby word as stby.
+        Use lower-case s here so Standby uses a full S-style segment pattern,
+        while uppercase S remains the custom service/slave marker.
+      */
+      setDisplayText("stby");
+      return;
+    }
+
+    if (standbyTimeAdjustMode) {
+      setDisplaySessionTime(selectedStandbyTimeMin);
+    } else {
+      setDisplayCountdownSeconds(remainingStandbyTimeSec);
+    }
+
+    return;
+  }
+
+  indicatorMask &= ~LED_STANDBY;
+  indicatorMask |= (LED_ON | LED_TEMP);
+  setDisplayTemperatureSetPoint(temperatureSetPointC);
+}
+
+void startStandbyIntroFlash() {
+  /*
+    Standby display alternates STBY/time while remaining time is 1 minute or more.
+    Below 1 minute, the display must show the seconds countdown continuously
+    to avoid visible skipping.
+  */
+
+  if (remainingStandbyTimeSec != COUNTDOWN_UNLIMITED_SECONDS && remainingStandbyTimeSec < 60UL) {
+    standbyFlashActive = false;
+    standbyFlashShowWord = false;
+    updateStandbyModeDisplay();
+    return;
+  }
+
+  standbyFlashActive = true;
+  standbyFlashShowWord = true;
+  standbyFlashStartTime = millis();
+  lastStandbyFlashToggleTime = millis();
+  updateStandbyModeDisplay();
+}
+
+void stopStandbyIntroFlash() {
+  standbyFlashActive = false;
+  standbyFlashShowWord = false;
+}
+
+void updateStandbyIntroFlash() {
+  if (!standbyFlashActive) {
+    return;
+  }
+
+  if (uiOperationMode != UI_MODE_STANDBY || activeErrorCode != 0 || drainDisplayActive || cabinLightAdjustMode || scentPumpAdjustMode || uiSettingMode != UI_SETTING_NONE) {
+    stopStandbyIntroFlash();
+    return;
+  }
+
+  /*
+    Below 1 minute, stop alternating and show seconds continuously.
+  */
+  if (remainingStandbyTimeSec != COUNTDOWN_UNLIMITED_SECONDS && remainingStandbyTimeSec < 60UL) {
+    stopStandbyIntroFlash();
+    updateStandbyModeDisplay();
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if ((now - lastStandbyFlashToggleTime) >= STANDBY_FLASH_INTERVAL_MS) {
+    lastStandbyFlashToggleTime = now;
+    standbyFlashShowWord = !standbyFlashShowWord;
+    updateStandbyModeDisplay();
+  }
+}
+
+void saveStandbyTimeIfChanged() {
+  if (!standbyTimeValueChanged) {
+    return;
+  }
+
+  standbyTimeValueChanged = false;
+
+  /*
+    Keep the UI display synchronized immediately after saving.
+    The Power Controller will also confirm/correct this through heartbeat ACK.
+  */
+  if (maxStandbyTimeMinFromDip == SESSION_TIME_UNLIMITED && selectedStandbyTimeMin >= SESSION_TIME_24H_MIN) {
+    remainingStandbyTimeSec = COUNTDOWN_UNLIMITED_SECONDS;
+  } else {
+    remainingStandbyTimeSec = (uint32_t)selectedStandbyTimeMin * 60UL;
+  }
+
+  lastLocalCountdownTickTime = millis();
+  sendUiSettingsToPowerController();
+  saveSettingsToEEPROM();
+  triggerBuzzer(300);
+}
+
+void enterStandbyModeFromS4() {
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  if (activeErrorCode != 0) {
+    return;
+  }
+
+  if (standbyDisabledByDip) {
+    standbyTimeAdjustMode = false;
+    setDisplayColonOnly();
+    return;
+  }
+
+  drainDisplayActive = false;
+
+  uiOperationMode = UI_MODE_STANDBY;
+  standbyTimeAdjustMode = true;
+  standbyTimeValueChanged = false;
+
+  if (maxStandbyTimeMinFromDip == SESSION_TIME_UNLIMITED && selectedStandbyTimeMin >= SESSION_TIME_24H_MIN) {
+    remainingStandbyTimeSec = COUNTDOWN_UNLIMITED_SECONDS;
+  } else {
+    remainingStandbyTimeSec = (uint32_t)selectedStandbyTimeMin * 60UL;
+  }
+
+  lastLocalCountdownTickTime = millis();
+  lastStandbyKeyTime = millis();
+
+  uiSettingMode = UI_SETTING_NONE;
+  cabinLightAdjustMode = false;
+
+  sendOperationModeToPowerController(1);
+  startStandbyIntroFlash();
+  triggerBuzzer(100);
+}
+
+void enterSessionModeFromS4() {
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  saveStandbyTimeIfChanged();
+
+  drainDisplayActive = false;
+
+  uiOperationMode = UI_MODE_SESSION;
+  uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+  standbyTimeAdjustMode = false;
+  stopStandbyIntroFlash();
+
+  sendOperationModeToPowerController(0);
+  triggerBuzzer(100);
+  updateStandbyModeDisplay();
+}
+
+void updateS4StandbyLogic() {
+  if (activeErrorCode != 0) {
+    standbyTimeAdjustMode = false;
+    return;
+  }
+
+  if (uiMainState != UI_MAIN_ON) {
+    standbyTimeAdjustMode = false;
+    return;
+  }
+
+  if (s4LongPressEvent) {
+    s4LongPressEvent = false;
+
+    if (uiOperationMode == UI_MODE_STANDBY) {
+      /*
+      If adjusting Standby Time:
+        S4 hold is 5 seconds and saves the value.
+
+      If not adjusting Standby Time:
+        S4 hold is 3 seconds and starts force drain.
+    */
+      if (standbyTimeAdjustMode) {
+        saveStandbyTimeIfChanged();
+        standbyTimeAdjustMode = false;
+        standbyTimeValueChanged = false;
+        updateStandbyModeDisplay();
+        return;
+      }
+
+      stopStandbyIntroFlash();
+      drainDisplayActive = false;
+      sendDrainFillStartToPowerController();
+    }
+
+    return;
+  }
+
+  if (s4ShortPressEvent) {
+    s4ShortPressEvent = false;
+
+    if (drainDisplayActive) {
+      return;
+    }
+
+    if (uiOperationMode == UI_MODE_STANDBY) {
+      enterSessionModeFromS4();
+    } else {
+      enterStandbyModeFromS4();
+    }
+
+    return;
+  }
+
+  if (uiOperationMode != UI_MODE_STANDBY || standbyDisabledByDip) {
+    return;
+  }
+
+  bool adjustmentAction = false;
+  bool valueChanged = false;
+  bool limitReached = false;
+
+  if (consumeS5DecreaseAction()) {
+    adjustmentAction = true;
+
+    if (selectedStandbyTimeMin > SESSION_TIME_MIN_MIN) {
+      selectedStandbyTimeMin -= SESSION_TIME_STEP_MIN;
+
+      if (selectedStandbyTimeMin < SESSION_TIME_MIN_MIN) {
+        selectedStandbyTimeMin = SESSION_TIME_MIN_MIN;
+      }
+
+      valueChanged = true;
+    } else {
+      limitReached = true;
+    }
+  }
+
+  if (consumeS7IncreaseAction()) {
+    adjustmentAction = true;
+
+    uint16_t maxStandby = maxStandbyTimeMinFromDip;
+
+    if (maxStandby == SESSION_TIME_UNLIMITED) {
+      maxStandby = SESSION_TIME_24H_MIN;
+    }
+
+    if (selectedStandbyTimeMin < maxStandby) {
+      selectedStandbyTimeMin += SESSION_TIME_STEP_MIN;
+
+      if (selectedStandbyTimeMin > maxStandby) {
+        selectedStandbyTimeMin = maxStandby;
+      }
+
+      valueChanged = true;
+    } else {
+      limitReached = true;
+    }
+  }
+
+  if (adjustmentAction) {
+    standbyTimeAdjustMode = true;
+    lastStandbyKeyTime = millis();
+
+    if (valueChanged) {
+      standbyTimeValueChanged = true;
+      updateStandbyModeDisplay();
+    } else if (limitReached) {
+      if (s7StablePressed) {
+        fastBeeping();
+      } else if (s5StablePressed) {
+        fastBeeping2();
+      } else {
+        triggerBuzzer(75);
+      }
+      updateStandbyModeDisplay();
+    }
+  }
+
+  if (standbyTimeAdjustMode && ((millis() - lastStandbyKeyTime) >= SETTINGS_TIMEOUT_MS)) {
+    saveStandbyTimeIfChanged();
+    standbyTimeAdjustMode = false;
+    standbyTimeValueChanged = false;
+    updateStandbyModeDisplay();
+  }
+}
+
+
+// ======================================================
+// LOCAL COUNTDOWN DISPLAY LOGIC
+// ======================================================
+
+void updateLocalCountdownTimers() {
+  /*
+    UI display countdown runs locally every second.
+    Power Controller heartbeat periodically corrects it.
+  */
+
+  if (uiMainState != UI_MAIN_ON || activeErrorCode != 0) {
+    lastLocalCountdownTickTime = millis();
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if ((now - lastLocalCountdownTickTime) < 1000UL) {
+    return;
+  }
+
+  unsigned long elapsedSec = (now - lastLocalCountdownTickTime) / 1000UL;
+  lastLocalCountdownTickTime += elapsedSec * 1000UL;
+
+  if (uiOperationMode == UI_MODE_SESSION && remainingSessionTimeSec != COUNTDOWN_UNLIMITED_SECONDS) {
+    if (remainingSessionTimeSec > elapsedSec) {
+      remainingSessionTimeSec -= elapsedSec;
+    } else {
+      remainingSessionTimeSec = 0;
+    }
+
+    if (uiSettingMode == UI_SETTING_NONE && !cabinLightAdjustMode && !scentPumpAdjustMode && !standbyTimeAdjustMode && uiNormalDisplayMode == UI_NORMAL_DISPLAY_SESSION_TIME) {
+      updateNormalSessionDisplay();
+    }
+  }
+
+  if (uiOperationMode == UI_MODE_STANDBY && remainingStandbyTimeSec != COUNTDOWN_UNLIMITED_SECONDS) {
+    if (remainingStandbyTimeSec > elapsedSec) {
+      remainingStandbyTimeSec -= elapsedSec;
+    } else {
+      remainingStandbyTimeSec = 0;
+    }
+
+    if (!standbyTimeAdjustMode && !drainDisplayActive && !cabinLightAdjustMode && !scentPumpAdjustMode && uiSettingMode == UI_SETTING_NONE) {
+      if (!standbyFlashActive || remainingStandbyTimeSec < 60UL) {
+        updateStandbyModeDisplay();
+      }
+    }
+  }
+
+  if (drainDisplayActive) {
+    if (remainingDrainTimeSec > elapsedSec) {
+      remainingDrainTimeSec -= elapsedSec;
+    } else {
+      remainingDrainTimeSec = 0;
+    }
+
+    updateDrainModeDisplay();
+  }
+}
+
+// ======================================================
+// MULTIPLE STEAM GENERATOR SERVICE MODE
+// ======================================================
+
+uint8_t getDisplayedServiceStatus(uint8_t slaveId, uint8_t *errorCode) {
+  if (errorCode != NULL) {
+    *errorCode = 0;
+  }
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES) {
+    return 0;
+  }
+  uint8_t status = serviceSlaveStatus[slaveId];
+  if (status > 3) {
+    status = 0;
+  }
+  if (status == 2 && errorCode != NULL) {
+    *errorCode = serviceSlaveError[slaveId];
+  }
+  return status;
+}
+
+void showServiceModeDisplay() {
+  unsigned long now = millis();
+
+  if (serviceModeIntroActive) {
+    setDisplayServiceModeText();
+    if ((now - serviceModeIntroStartTime) >= 1000UL) {
+      serviceModeIntroActive = false;
+      lastServiceDisplayToggleTime = now;
+      serviceDisplayShowSlave = true;
+      sendSlaveStatusRequest(serviceSelectedSlave);
+    }
+    return;
+  }
+
+  if ((now - lastServiceDisplayToggleTime) >= 1000UL) {
+    lastServiceDisplayToggleTime = now;
+    serviceDisplayShowSlave = !serviceDisplayShowSlave;
+  }
+
+  if (serviceDisplayShowSlave) {
+    setDisplaySlaveId(serviceSelectedSlave);
+    return;
+  }
+
+  uint8_t errorCode = 0;
+  uint8_t status = getDisplayedServiceStatus(serviceSelectedSlave, &errorCode);
+
+  if (status == 1) {
+    setDisplayOkText();
+  } else if (status == 2) {
+    setDisplayError(errorCode ? errorCode : 13);
+  } else if (status == 3) {
+    setDisplayOfText();
+  } else {
+    setDisplayMissingText();
+  }
+}
+
+void enterServiceMode() {
+  serviceModeActive = true;
+  serviceModeIntroActive = true;
+  serviceModeIntroStartTime = millis();
+  serviceSelectedSlave = 1;
+  serviceDesiredStatus = 1;
+  serviceDisplayShowSlave = true;
+  lastServiceDisplayToggleTime = millis();
+  lastServiceStatusRequestTime = 0;
+  serviceS4SaveHoldStartTime = 0;
+  serviceS4SaveDone = false;
+
+  s2PressEvent = false;
+  s4ShortPressEvent = false;
+  s4LongPressEvent = false;
+  s5PressEvent = false;
+  s6ShortPressEvent = false;
+  s6LongPressEvent = false;
+  s7PressEvent = false;
+
+  setDisplayServiceModeText();
+  triggerBuzzer(100);
+}
+
+bool updateServiceModeLogic() {
+  unsigned long now = millis();
+
+  // Entry: OFF state only, hold S4 + S3/Light for 3 seconds.
+  if (!serviceModeActive) {
+    if (uiMainState == UI_MAIN_OFF && startupState == UI_START_OFF && activeErrorCode == 0) {
+      if (s4StablePressed && s3StablePressed) {
+        if (serviceEntryHoldStartTime == 0) {
+          serviceEntryHoldStartTime = now;
+          serviceEntryTriggered = false;
+        }
+        if (!serviceEntryTriggered && ((now - serviceEntryHoldStartTime) >= SERVICE_MODE_ENTRY_HOLD_MS)) {
+          serviceEntryTriggered = true;
+          enterServiceMode();
+          return true;
+        }
+      } else {
+        serviceEntryHoldStartTime = 0;
+        serviceEntryTriggered = false;
+      }
+    }
+    return false;
+  }
+
+  // Service Mode owns S4/S5/S6/S7 and Light while active.
+  if ((now - lastServiceStatusRequestTime) >= SERVICE_STATUS_REQUEST_INTERVAL_MS) {
+    lastServiceStatusRequestTime = now;
+    sendSlaveStatusRequest(serviceSelectedSlave);
+  }
+
+  if (s6ShortPressEvent) {
+    s6ShortPressEvent = false;
+    serviceModeActive = false;
+    serviceModeIntroActive = false;
+    showOffStateDisplay();
+    triggerBuzzer(100);
+    piezoBuzz();
+    return true;
+  }
+
+  if (consumeS5DecreaseAction()) {
+    if (serviceSelectedSlave <= 1) {
+      serviceSelectedSlave = MAX_GENERATOR_SLAVES;
+    } else {
+      serviceSelectedSlave--;
+    }
+    serviceDisplayShowSlave = true;
+    lastServiceDisplayToggleTime = now;
+    serviceDesiredStatus = (serviceSlaveStatus[serviceSelectedSlave] == 3) ? 3 : 1;
+    sendSlaveStatusRequest(serviceSelectedSlave);
+  }
+
+  if (consumeS7IncreaseAction()) {
+    serviceSelectedSlave++;
+    if (serviceSelectedSlave > MAX_GENERATOR_SLAVES) {
+      serviceSelectedSlave = 1;
+    }
+    serviceDisplayShowSlave = true;
+    lastServiceDisplayToggleTime = now;
+    serviceDesiredStatus = (serviceSlaveStatus[serviceSelectedSlave] == 3) ? 3 : 1;
+    sendSlaveStatusRequest(serviceSelectedSlave);
+  }
+
+  if (s4ShortPressEvent) {
+    s4ShortPressEvent = false;
+    serviceDesiredStatus = (serviceDesiredStatus == 1) ? 3 : 1; // OK <-> OF
+    serviceSlaveStatus[serviceSelectedSlave] = serviceDesiredStatus;
+    serviceSlaveError[serviceSelectedSlave] = 0;
+    serviceDisplayShowSlave = false;
+    lastServiceDisplayToggleTime = now;
+  }
+
+  // Save selected OK/OF using independent 3-second S4 hold inside Service Mode.
+  if (s4StablePressed) {
+    if (serviceS4SaveHoldStartTime == 0) {
+      serviceS4SaveHoldStartTime = now;
+      serviceS4SaveDone = false;
+    }
+    if (!serviceS4SaveDone && ((now - serviceS4SaveHoldStartTime) >= SERVICE_MODE_SAVE_HOLD_MS)) {
+      serviceS4SaveDone = true;
+      sendSlaveServiceSet(serviceSelectedSlave, serviceDesiredStatus);
+      sendSlaveStatusRequest(serviceSelectedSlave);
+      triggerBuzzer(300);
+    }
+  } else {
+    serviceS4SaveHoldStartTime = 0;
+    serviceS4SaveDone = false;
+  }
+
+  s2PressEvent = false;
+  s4LongPressEvent = false;
+  s5PressEvent = false;
+  s7PressEvent = false;
+
+  showServiceModeDisplay();
+  return true;
+}
+
+
+// ======================================================
+// BUZZER LOGIC - reference UI style
+// ======================================================
+
+void triggerBuzzer(uint16_t durationMs) {
+  pzDetect = 1;
+  intervalBuz = durationMs;
+}
+
+void fastBeeping() {
+  unsigned long beepBuzzer = millis();
+  if (beepBuzzer - prevbeepBuzzer >= (unsigned long)beepBuzzerInterval) {
+    beepBuzzerInterval = beepBuzzerInterval - 25;
+    if (beepBuzzerInterval < 100) {
+      beepBuzzerInterval = 100;
+    }
+    pzDetect = 1;
+    intervalBuz = 75;
+    prevbeepBuzzer = beepBuzzer;
+  }
+}
+
+void fastBeeping2() {
+  unsigned long beepBuzzer2 = millis();
+  if (beepBuzzer2 - prevbeepBuzzer2 >= (unsigned long)beepBuzzerInterval2) {
+    beepBuzzerInterval2 = beepBuzzerInterval2 - 25;
+    if (beepBuzzerInterval2 < 100) {
+      beepBuzzerInterval2 = 100;
+    }
+    pzDetect = 1;
+    intervalBuz = 75;
+    prevbeepBuzzer2 = beepBuzzer2;
+  }
+}
+
+void resetFastBeepingUp() {
+  beepBuzzerInterval = 500;
+}
+
+void resetFastBeepingDown() {
+  beepBuzzerInterval2 = 500;
+}
+
+void piezoBuzz()
+{
+  if (pzDetect == 1)
+  {
+    tone(peZO, 4000);
+    unsigned long currentMilBuz = millis();
+    if (currentMilBuz - previousMilBuz > (unsigned long)intervalBuz)
+    {
+      pzDetect = 0;
+    }
+  }
+  else
+  {
+    noTone(peZO);
+    previousMilBuz = millis();
+  }
+}
+
+void updateErrorBuzzer() {
+  if (!errorDisplayActive || activeErrorCode == 0 || startupState != UI_START_OFF) {
+    stopPzDetect = 0;
+    return;
+  }
+
+  /*
+    Original error-style beep:
+      intervalBuz = 50;
+      trigger only when the visible display changes back to the error.
+  */
+  intervalBuz = 50;
+
+  bool visibleErrorNow;
+  if (activeErrorFromSlave && activeErrorSlaveId >= 1 && activeErrorSlaveId <= MAX_GENERATOR_SLAVES) {
+    visibleErrorNow = !slaveErrorDisplayShowSlave;
+  } else {
+    visibleErrorNow = errorBlinkVisible;
+  }
+
+  if (visibleErrorNow) {
+    if (stopPzDetect == 1) {
+      pzDetect = 1;
+      stopPzDetect = 0;
+    }
+  } else {
+    stopPzDetect = 1;
+  }
+}
+
+// ======================================================
+// ERROR DISPLAY LOGIC
+// ======================================================
+
+void updateErrorDisplay() {
+  /*
+    Error display behavior after startup:
+      E1..E13 ON for ERROR_BLINK_INTERVAL_MS
+      blank  OFF for ERROR_BLINK_INTERVAL_MS
+
+  */
+
+  if (activeErrorCode == 0 || !errorDisplayActive) {
+    return;
+  }
+
+  // Do not override PC/UI version startup sequence.
+  if (startupState != UI_START_OFF) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if ((now - lastErrorBlinkToggleTime) >= ERROR_BLINK_INTERVAL_MS) {
+    lastErrorBlinkToggleTime = now;
+    errorBlinkVisible = !errorBlinkVisible;
+  }
+
+  if (activeErrorFromSlave && activeErrorSlaveId >= 1 && activeErrorSlaveId <= MAX_GENERATOR_SLAVES) {
+    if ((now - lastSlaveErrorDisplayToggleTime) >= SLAVE_ERROR_DISPLAY_INTERVAL_MS) {
+      lastSlaveErrorDisplayToggleTime = now;
+      slaveErrorDisplayShowSlave = !slaveErrorDisplayShowSlave;
+    }
+
+    if (slaveErrorDisplayShowSlave) {
+      setDisplaySlaveId(activeErrorSlaveId);
+    } else {
+      setDisplayError(activeErrorCode);
+    }
+    return;
+  }
+
+  if (errorBlinkVisible) {
+    setDisplayError(activeErrorCode);
+  } else {
+    setDisplayBlank();
+  }
+}
+
+void triggerLocalE11CommunicationError() {
+  /*
+    UI-side E11:
+      If the UI does not receive heartbeat ACK from the Power Controller
+      for 10 seconds, display E11.
+
+    E11 is a UI communication failure, so it is allowed to display directly.
+  */
+
+  if (activeErrorCode != 0 && activeErrorCode != 11) {
+    return;  // Do not overwrite another active error.
+  }
+
+  if (localE11Active && activeErrorCode == 11 && errorDisplayActive) {
+    return;
+  }
+
+  localE11Active = true;
+  activeErrorCode = 11;
+
+  if (startupState != UI_START_OFF) {
+    startupState = UI_START_OFF;
+  }
+
+  activateErrorDisplayNow(11);
+}
+
+void updatePowerOnPending() {
+  if (uiMainState != UI_MAIN_POWER_ON_PENDING) {
+    return;
+  }
+
+  if (activeErrorCode != 0) {
+    activateErrorDisplayNow(activeErrorCode);
+    return;
+  }
+
+  setDisplayBlank();
+
+  if ((millis() - lastPowerCommandTime) >= POWER_COMMAND_REPEAT_MS) {
+    sendPowerOnCommand();
+  }
+}
+
+void startTargetTemperatureIntroBlink() {
+  showTempBlinking = true;
+  tempBlinkVisible = true;
+  tempBlinkStartTime = millis();
+  lastTempBlinkToggleTime = millis();
+
+  uiFiveButtonMenuActive = false;
+  uiFiveButtonMenuFeature = UI_MENU_FAN;
+  uiNormalDisplayMode = UI_NORMAL_DISPLAY_TEMPERATURE;
+
+  indicatorMask &= ~(LED_SESSION | LED_STANDBY | LED_FAN | LED_SCENT);
+  indicatorMask |= LED_ON | LED_TEMP;
+  setDisplayTemperatureSetPoint(temperatureSetPointC);
+}
+
+void updateTemperatureBlinkDisplay() {
+  /*
+    ON-entry display behavior:
+      OFF ':' -> short S6 -> accepted ON
+      -> target temperature blinks for 5 seconds
+      -> default display becomes actual cabin temperature.
+  */
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  if (uiOperationMode != UI_MODE_SESSION) {
+    return;
+  }
+
+  if (!showTempBlinking) {
+    return;
+  }
+
+  if (errorDisplayActive && activeErrorCode != 0) {
+    showTempBlinking = false;
+    return;
+  }
+
+  if (drainDisplayActive || cabinLightAdjustMode || scentPumpAdjustMode ||
+      standbyTimeAdjustMode || uiSettingMode != UI_SETTING_NONE) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  /*
+    Only the 7-segment display blinks during ON-entry target-temperature display.
+    Indicator LEDs remain steady; do not use tempBlinkVisible to blank LED indicators.
+  */
+  indicatorMask &= ~(LED_SESSION | LED_STANDBY | LED_FAN | LED_SCENT);
+  indicatorMask |= LED_ON | LED_TEMP;
+
+  if ((now - tempBlinkStartTime) >= TEMP_BLINK_DURATION_MS) {
+    showTempBlinking = false;
+    tempBlinkVisible = true;
+    showDefaultActualTemperatureDisplay();
+    return;
+  }
+
+  if ((now - lastTempBlinkToggleTime) >= TEMP_BLINK_INTERVAL_MS) {
+    lastTempBlinkToggleTime = now;
+    tempBlinkVisible = !tempBlinkVisible;
+  }
+
+  if (tempBlinkVisible) {
+    setDisplayTemperatureSetPoint(temperatureSetPointC);
+  } else {
+    setSevenSegmentBlankOnly();
+  }
+}
+
+void updateFanAndScentPumpLogic() {
+  /*
+    S3 behavior:
+      Short press = enter Scent Pump setpoint mode
+      3 sec hold  = toggle Fan, only if NOT adjusting scent pump
+      5 sec hold  = save Scent Pump, only if adjusting scent pump
+  */
+
+  if (uiMainState != UI_MAIN_ON) {
+    return;
+  }
+
+  if (activeErrorCode != 0) {
+    return;
+  }
+
+  if (drainDisplayActive) {
+    return;
+  }
+
+  /*
+    S3 hold action:
+      - If scentPumpAdjustMode is active, this is a 5-second save.
+      - If scentPumpAdjustMode is not active, this is a 3-second fan toggle.
+  */
+  if (s3LongPressEvent) {
+    s3LongPressEvent = false;
+
+    if (scentPumpAdjustMode) {
+      scentPumpAdjustMode = false;
+
+      sendScentPumpSetPointToPowerController(scentPumpSetPoint);
+      saveSettingsToEEPROM();
+      scentPumpRequestedOn = true;
+      indicatorMask |= LED_SCENT;
+
+      restoreNormalDisplayAfterScentPump();
+      return;
+    }
+
+    fanRequestedOn = !fanRequestedOn;
+
+    if (fanRequestedOn) {
+      indicatorMask |= LED_FAN;
+    } else {
+      indicatorMask &= ~LED_FAN;
+    }
+
+    sendFanControlToPowerController(fanRequestedOn);
+    return;
+  }
+
+  /*
+    Short S3:
+      Enter scent pump setpoint mode.
+      Display starts at 0.
+      Save by holding S3 for 5 seconds
+      or by no key press timeout.
+  */
+  if (s3ShortPressEvent) {
+    s3ShortPressEvent = false;
+
+    cancelOtherTemporaryDisplaysForScentPump();
+
+    scentPumpAdjustMode = true;
+    scentPumpRequestedOn = true;
+
+    /*
+      Do not reset the setpoint when entering scent pump adjustment.
+      Show the last saved/current value.
+    */
+    if (scentPumpSetPoint < SCENT_PUMP_MIN_SETPOINT) {
+      scentPumpSetPoint = SCENT_PUMP_MIN_SETPOINT;
+    }
+
+    if (scentPumpSetPoint > SCENT_PUMP_MAX_SETPOINT) {
+      scentPumpSetPoint = SCENT_PUMP_MAX_SETPOINT;
+    }
+
+    lastScentPumpKeyTime = millis();
+
+    indicatorMask |= LED_SCENT;
+    setDisplayScentPumpSetPoint(scentPumpSetPoint);
+
+    return;
+  }
+}
+
+void updateScentPumpAdjustMode() {
+  /*
+    Scent Pump setpoint mode:
+      S5 decreases 0..20
+      S7 increases 0..20
+      Save by:
+        - S3 hold for 5 seconds
+        - no key press timeout
+  */
+
+  if (!scentPumpAdjustMode) {
+    return;
+  }
+
+  if (uiMainState != UI_MAIN_ON || activeErrorCode != 0 || drainDisplayActive) {
+    scentPumpAdjustMode = false;
+    return;
+  }
+
+  /*
+    While scent pump adjustment is active, this display owns the screen.
+    Keep writing the setpoint so normal display cannot visually override it.
+  */
+  setDisplayScentPumpSetPoint(scentPumpSetPoint);
+
+  bool adjustmentAction = false;
+  bool valueChanged = false;
+  bool limitReached = false;
+
+  if (consumeS5DecreaseAction()) {
+    adjustmentAction = true;
+
+    if (scentPumpSetPoint > SCENT_PUMP_MIN_SETPOINT) {
+      scentPumpSetPoint--;
+      valueChanged = true;
+    } else {
+      limitReached = true;
+    }
+  }
+
+  if (consumeS7IncreaseAction()) {
+    adjustmentAction = true;
+
+    if (scentPumpSetPoint < SCENT_PUMP_MAX_SETPOINT) {
+      scentPumpSetPoint++;
+      valueChanged = true;
+    } else {
+      limitReached = true;
+    }
+  }
+
+  if (adjustmentAction) {
+    lastScentPumpKeyTime = millis();
+
+    if (valueChanged) {
+      setDisplayScentPumpSetPoint(scentPumpSetPoint);
+    } else if (limitReached) {
+      if (s7StablePressed) {
+        fastBeeping();
+      } else if (s5StablePressed) {
+        fastBeeping2();
+      } else {
+        triggerBuzzer(75);
+      }
+      setDisplayScentPumpSetPoint(scentPumpSetPoint);
+    }
+  }
+
+  /*
+    No key press timeout = save.
+  */
+  if ((millis() - lastScentPumpKeyTime) >= SCENT_PUMP_ADJUST_TIMEOUT_MS) {
+    scentPumpAdjustMode = false;
+
+    sendScentPumpSetPointToPowerController(scentPumpSetPoint);
+    saveSettingsToEEPROM();
+    triggerBuzzer(300);
+    scentPumpRequestedOn = true;
+    indicatorMask |= LED_SCENT;
+
+    restoreNormalDisplayAfterScentPump();
+  }
+}
+
+uint8_t calculateSettingsChecksum(
+  uint8_t targetTemp,
+  uint16_t sessionMin,
+  uint16_t standbyMin,
+  uint8_t scentSetPoint,
+  uint8_t cabinLightPercent) {
+  uint8_t checksum = 0;
+
+  checksum ^= EEPROM_MAGIC_VALUE;
+  checksum ^= EEPROM_SETTINGS_VERSION;
+  checksum ^= targetTemp;
+  checksum ^= lowByte(sessionMin);
+  checksum ^= highByte(sessionMin);
+  checksum ^= lowByte(standbyMin);
+  checksum ^= highByte(standbyMin);
+  checksum ^= scentSetPoint;
+  checksum ^= cabinLightPercent;
+
+  return checksum;
+}
+
+void saveSettingsToEEPROM() {
+  /*
+    Saves user preferences to EEPROM.
+
+    EEPROM.update() is used instead of EEPROM.write()
+    to avoid unnecessary EEPROM wear.
+
+    Saved settings:
+      - Target Temperature
+      - Session Time
+      - Standby Time
+      - Scent Pump Setpoint
+      - Cabin Light Dimmer Percent
+  */
+
+  uint8_t targetTemp = (uint8_t)temperatureSetPointC;
+  uint16_t sessionMin = selectedSessionTimeMin;
+  uint16_t standbyMin = selectedStandbyTimeMin;
+  uint8_t scentSetPoint = scentPumpSetPoint;
+  uint8_t cabinLightPercent = cabinLightSetPointPercent;
+
+  if (scentSetPoint < SCENT_PUMP_MIN_SETPOINT) {
+    scentSetPoint = SCENT_PUMP_MIN_SETPOINT;
+  }
+
+  if (scentSetPoint > SCENT_PUMP_MAX_SETPOINT) {
+    scentSetPoint = SCENT_PUMP_MAX_SETPOINT;
+  }
+
+  if (cabinLightPercent > 100) {
+    cabinLightPercent = 100;
+  }
+
+  cabinLightPercent = (cabinLightPercent / 5) * 5;
+
+  /*
+    Zero is OFF and should not be saved as the next ON brightness.
+    If the stored/current setpoint is accidentally zero, save the default 100%.
+  */
+  if (cabinLightPercent == 0) {
+    cabinLightPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+  }
+
+  uint8_t checksum = calculateSettingsChecksum(
+    targetTemp,
+    sessionMin,
+    standbyMin,
+    scentSetPoint,
+    cabinLightPercent);
+
+  EEPROM.update(EEPROM_ADDR_MAGIC, EEPROM_MAGIC_VALUE);
+  EEPROM.update(EEPROM_ADDR_VERSION, EEPROM_SETTINGS_VERSION);
+
+  EEPROM.update(EEPROM_ADDR_TARGET_TEMP, targetTemp);
+
+  EEPROM.update(EEPROM_ADDR_SESSION_LOW, lowByte(sessionMin));
+  EEPROM.update(EEPROM_ADDR_SESSION_HIGH, highByte(sessionMin));
+
+  EEPROM.update(EEPROM_ADDR_STANDBY_LOW, lowByte(standbyMin));
+  EEPROM.update(EEPROM_ADDR_STANDBY_HIGH, highByte(standbyMin));
+
+  EEPROM.update(EEPROM_ADDR_SCENT_SETPOINT, scentSetPoint);
+  EEPROM.update(EEPROM_ADDR_CABIN_LIGHT_PERCENT, cabinLightPercent);
+
+  EEPROM.update(EEPROM_ADDR_CHECKSUM, checksum);
+
+  /*
+    After a successful save, future DIP replies must not overwrite
+    user-saved Standby Time with the factory standby default.
+  */
+  settingsLoadedFromEEPROM = true;
+}
+
+void loadSettingsFromEEPROM() {
+  settingsLoadedFromEEPROM = false;
+
+  /*
+    Loads saved user preferences.
+
+    If EEPROM is blank, corrupted, or from another version,
+    the program keeps the normal factory defaults.
+  */
+
+  uint8_t magic = EEPROM.read(EEPROM_ADDR_MAGIC);
+  uint8_t version = EEPROM.read(EEPROM_ADDR_VERSION);
+
+  if (magic != EEPROM_MAGIC_VALUE || version != EEPROM_SETTINGS_VERSION) {
+    return;
+  }
+
+  uint8_t savedTargetTemp = EEPROM.read(EEPROM_ADDR_TARGET_TEMP);
+
+  uint16_t savedSessionMin =
+    (uint16_t)EEPROM.read(EEPROM_ADDR_SESSION_LOW) | ((uint16_t)EEPROM.read(EEPROM_ADDR_SESSION_HIGH) << 8);
+
+  uint16_t savedStandbyMin =
+    (uint16_t)EEPROM.read(EEPROM_ADDR_STANDBY_LOW) | ((uint16_t)EEPROM.read(EEPROM_ADDR_STANDBY_HIGH) << 8);
+
+  uint8_t savedScentSetPoint = EEPROM.read(EEPROM_ADDR_SCENT_SETPOINT);
+  uint8_t savedCabinLightPercent = EEPROM.read(EEPROM_ADDR_CABIN_LIGHT_PERCENT);
+
+  uint8_t savedChecksum = EEPROM.read(EEPROM_ADDR_CHECKSUM);
+
+  uint8_t calculatedChecksum = calculateSettingsChecksum(
+    savedTargetTemp,
+    savedSessionMin,
+    savedStandbyMin,
+    savedScentSetPoint,
+    savedCabinLightPercent);
+
+  if (savedChecksum != calculatedChecksum) {
+    return;
+  }
+
+  /*
+    Validate Target Temperature.
+    DIP4 final clamp to 50/55 is still handled by onDipSettingsReply().
+  */
+  if (savedTargetTemp < TARGET_TEMP_MIN_C) {
+    savedTargetTemp = TARGET_TEMP_MIN_C;
+  }
+
+  if (savedTargetTemp > 55) {
+    savedTargetTemp = 55;
+  }
+
+  temperatureSetPointC = savedTargetTemp;
+
+  /*
+    Validate Session Time.
+  */
+  if (savedSessionMin == SESSION_TIME_UNLIMITED) {
+    selectedSessionTimeMin = SESSION_TIME_24H_MIN;
+  } else {
+    if (savedSessionMin < SESSION_TIME_MIN_MIN) {
+      savedSessionMin = SESSION_TIME_MIN_MIN;
+    }
+
+    if (savedSessionMin > SESSION_TIME_24H_MIN) {
+      savedSessionMin = SESSION_TIME_24H_MIN;
+    }
+
+    selectedSessionTimeMin = savedSessionMin;
+  }
+
+  /*
+    Validate Standby Time.
+  */
+  if (savedStandbyMin == SESSION_TIME_UNLIMITED) {
+    selectedStandbyTimeMin = SESSION_TIME_24H_MIN;
+  } else {
+    if (savedStandbyMin < SESSION_TIME_MIN_MIN) {
+      savedStandbyMin = SESSION_TIME_MIN_MIN;
+    }
+
+    if (savedStandbyMin > SESSION_TIME_24H_MIN) {
+      savedStandbyMin = SESSION_TIME_24H_MIN;
+    }
+
+    selectedStandbyTimeMin = savedStandbyMin;
+  }
+
+  /*
+    Validate Scent Pump setpoint.
+    User Interface range is 1..20 only.
+  */
+  if (savedScentSetPoint < SCENT_PUMP_MIN_SETPOINT) {
+    savedScentSetPoint = SCENT_PUMP_MIN_SETPOINT;
+  }
+
+  if (savedScentSetPoint > SCENT_PUMP_MAX_SETPOINT) {
+    savedScentSetPoint = SCENT_PUMP_MAX_SETPOINT;
+  }
+
+  scentPumpSetPoint = savedScentSetPoint;
+  scentPumpRequestedOn = true;
+
+  /*
+    Validate Cabin Light Dimmer Percent.
+    Range: 0, 5, 10 ... 100.
+  */
+  if (savedCabinLightPercent > 100) {
+    savedCabinLightPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+  }
+
+  savedCabinLightPercent = (savedCabinLightPercent / 5) * 5;
+
+  cabinLightSetPointPercent = savedCabinLightPercent;
+
+  /*
+    EEPROM stores the saved dimming level only.
+    Loading EEPROM must NOT turn the cabin light ON at startup.
+  */
+  cabinLightOn = false;
+
+  /*
+    Mark EEPROM as valid only after all values and checksum passed validation.
+  */
+  settingsLoadedFromEEPROM = true;
+
+  /*
+    Prepare local countdown values based on saved settings.
+  */
+  remainingSessionTimeSec = (uint32_t)selectedSessionTimeMin * 60UL;
+  remainingStandbyTimeSec = (uint32_t)selectedStandbyTimeMin * 60UL;
+}
+
+// ======================================================
+// SETUP
+// ======================================================
+
+void setup() {
+  preloadDisplayPinsOff();
+  setSegmentPinsOutput();
+
+  for (uint8_t i = 0; i < 5; i++) {
+    pinMode(columnPins[i], OUTPUT);
+  }
+
+  allColumnsOff();
+  allSegmentsOff();
+  disableDisplayOutput();
+  setupDisplayRefreshTimer1();
+
+
+  pinMode(RS485_TXEN_PIN, OUTPUT);
+  digitalWrite(RS485_TXEN_PIN, LOW);
+  pinMode(S1_ON_OFF_PIN, INPUT_PULLUP);
+  pinMode(S2_CABIN_LIGHT_PIN, INPUT_PULLUP);
+  pinMode(BUZZER_PIN, OUTPUT);
+  noTone(BUZZER_PIN);
+
+  s2StablePressed = false;
+  s2LastRawPressed = false;
+  s2LastChangeTime = 0;
+  s2PressEvent = false;
+
+  cabinLightOn = false;
+  cabinLightSetPointPercent = 0;
+
+  s3StablePressed = false;
+  s3LastRawPressed = false;
+  s3LastChangeTime = 0;
+  s3PressStartTime = 0;
+  s3ShortPressEvent = false;
+  s3LongPressEvent = false;
+  s3LongPressReported = false;
+
+  fanRequestedOn = false;
+  scentPumpRequestedOn = true;
+  scentPumpAdjustMode = false;
+  scentPumpSetPoint = 1;
+  lastScentPumpKeyTime = 0;
+
+  loadSettingsFromEEPROM();
+
+  if (cabinLightSetPointPercent == 0) {
+    cabinLightSetPointPercent = CABIN_LIGHT_DEFAULT_PERCENT;
+  }
+
+  s1StablePressed = false;
+  s1LastRawPressed = false;
+  s1LastChangeTime = 0;
+  s1PressEvent = false;
+
+  s4StablePressed = false;
+  s4LastRawPressed = false;
+  s4LastChangeTime = 0;
+  s4PressStartTime = 0;
+  s4ShortPressEvent = false;
+  s4LongPressEvent = false;
+  s4LongPressReported = false;
+
+  s5StablePressed = false;
+  s5LastRawPressed = false;
+  s5LastChangeTime = 0;
+  s5PressEvent = false;
+
+  s7StablePressed = false;
+  s7LastRawPressed = false;
+  s7LastChangeTime = 0;
+  s7PressEvent = false;
+
+  s6StablePressed = false;
+  s6LastRawPressed = false;
+  s6LastChangeTime = 0;
+  s6PressStartTime = 0;
+  s6ShortPressEvent = false;
+  s6LongPressEvent = false;
+  s6LongPressPending = false;
+  s6LongPressReported = false;
+
+  setDisplayBlank();
+  indicatorMask = 0;
+
+  ICSC.begin(UI_ADDRESS, ICSC_BAUD, &Serial, RS485_TXEN_PIN);
+  ICSC.registerCommand(CMD_HEARTBEAT, &onHeartbeatFromPowerController);
+  ICSC.registerCommand(CMD_HEARTBEAT_ACK, &onHeartbeatAck);
+  ICSC.registerCommand(CMD_VERSION_REPLY, &onVersionReply);
+  ICSC.registerCommand(CMD_POWER_ON_ACK, &onPowerOnAck);
+  ICSC.registerCommand(CMD_ERROR_REPORT, &onErrorReport);
+  ICSC.registerCommand(CMD_SLAVE_STATUS_REPLY, &onSlaveStatusReply);
+  ICSC.registerCommand(CMD_SLAVE_SERVICE_ACK, &onSlaveServiceAck);
+  ICSC.registerCommand(CMD_CABIN_LIGHT_STATUS, &onCabinLightStatus);
+  ICSC.registerCommand(CMD_DIP_REPLY, &onDipSettingsReply);
+  ICSC.registerCommand(CMD_UI_SETTINGS_ACK, &onUiSettingsAck);
+  ICSC.registerCommand(CMD_FAN_STATUS, &onFanStatus);
+  ICSC.registerCommand(CMD_SCENT_PUMP_STATUS, &onScentPumpStatus);
+
+  lastHeartbeatSendTime = 0;
+  lastVersionRequestTime = 0;
+
+  pcVersionReceived = false;
+  pcVersionMajor = 0;
+  pcVersionMinor = 0;
+
+  drainDisplayActive = false;
+  pcDrainState = 0;
+  previousPcDrainState = 0;
+  drainDisplayStep = 0;
+
+  startupState = UI_START_REQUEST_PC_VERSION;
+  startupStateStartTime = millis();
+}
+
+// ======================================================
+// MAIN LOOP
+// ======================================================
+
+void loop() {
+  /* Display refresh is handled by Timer1 ISR. */
+
+  ICSC.process();
+  updateHeartbeat();
+
+  updateS1Button();
+  updateS2Button();
+  updateS3Button();
+
+  /*
+    Important:
+    This is now safe because updateS5S7Buttons()
+    only scans every 20 ms.
+  */
+  updateS5S7Buttons();
+
+  if (!s7StablePressed) {
+    resetFastBeepingUp();
+  }
+
+  if (!s5StablePressed) {
+    resetFastBeepingDown();
+  }
+
+  /*
+    Always allow startup version display to finish, even if E1-E13
+    is already received from the Power Controller.
+  */
+  if (startupState != UI_START_OFF) {
+    updateStartupSequence();
+  }
+
+  // E13 is a generator-chain configuration/communication fault.
+  // If it was received during version display, show it as soon as startup reaches OFF.
+  if (startupState == UI_START_OFF && activeErrorCode == 13 && !errorDisplayActive) {
+    activateErrorDisplayNow(13);
+  }
+
+  if (updateServiceModeLogic()) {
+    piezoBuzz();
+    return;
+  }
+
+  updateUiCommunicationWatchdog();
+  updateDipSettingsRequest();
+  updateLocalCountdownTimers();
+
+  updateFiveButtonPowerLogic();
+  updatePowerOnPending();
+
+  updateFiveButtonCabinLightLogic();
+  updateFiveButtonMenuLogic();
+  updateTemperatureBlinkDisplay();
+  updateStandbyIntroFlash();
+  updateDrainDisplayFlash();
+  updateCabinLightAdjustMode();
+
+  if (errorDisplayActive && activeErrorCode != 0) {
+    updateErrorDisplay();
+  } else if (activeErrorCode == 0 && !drainDisplayActive && !cabinLightAdjustMode && uiOperationMode != UI_MODE_STANDBY) {
+    showDefaultActualTemperatureDisplay();
+  }
+
+  /*
+    Keep the Cabin Light LED indicator synchronized after all display/UI
+    updates. This prevents Error-display blinking or setDisplayBlank() from
+    clearing the Light LED while the cabin light is still ON.
+  */
+  updateErrorBuzzer();
+  piezoBuzz();
+  syncCabinLightLedIndicator();
+}

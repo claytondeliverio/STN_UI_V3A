@@ -1,258 +1,336 @@
-#include <stdio.h>
 #include <stdbool.h>
 #include <stdint.h>
 #include <string.h>
 
-#include "freertos/FreeRTOS.h"
-#include "freertos/task.h"
 #include "driver/gpio.h"
 #include "driver/uart.h"
+#include "esp_check.h"
 #include "esp_err.h"
 #include "esp_log.h"
 #include "esp_timer.h"
-#include "nvs_flash.h"
-#include "nvs.h"
+#include "freertos/FreeRTOS.h"
+#include "freertos/task.h"
+#include "icsc.h"
 
-static const char *TAG = "ui_stn_wifi";
+static const char *TAG = "ui_v3a_heartbeat";
 
-/*
- * ATmega328P -> ESP32-C5-WROOM-1 porting scaffold.
- * The original sketch uses Arduino core APIs such as pinMode(), digitalWrite(),
- * digitalRead(), millis(), and EEPROM. This file provides an ESP-IDF equivalent
- * foundation so the UI firmware can be migrated without changing the original
- * control logic structure.
- */
+#define UI_ADDRESS 1
+#define POWER_CONTROLLER_ADDRESS 2
+#define ICSC_BAUD 57600UL
 
-/* UART / RS485 */
-#define UART_PORT UART_NUM_1
-#define UART_BAUD_RATE 57600
-#define UART_TX_PIN GPIO_NUM_17
-#define UART_RX_PIN GPIO_NUM_18
-#define RS485_TXEN_PIN GPIO_NUM_12
+#define CMD_HEARTBEAT 'H'
+#define CMD_HEARTBEAT_ACK 'h'
 
-/* UI button / LED / display pins mapped to ESP32-C5 GPIOs */
-#define S1_ON_OFF_PIN GPIO_NUM_4
-#define S2_CABIN_LIGHT_PIN GPIO_NUM_5
-#define S4_STANDBY_PIN GPIO_NUM_6
-#define S3_ADC_PIN GPIO_NUM_7
-#define S5_DOWN_PIN GPIO_NUM_8
-#define S6_TEMP_TIME_PIN GPIO_NUM_9
-#define S7_UP_PIN GPIO_NUM_10
-#define BUZZER_PIN GPIO_NUM_11
+#define HEARTBEAT_INTERVAL_MS 1000UL
+#define HEARTBEAT_ACK_TIMEOUT_MS 10000UL
 
-#define SEG_A_PIN GPIO_NUM_13
-#define SEG_B_PIN GPIO_NUM_14
-#define SEG_C_PIN GPIO_NUM_15
-#define SEG_D_PIN GPIO_NUM_16
-#define SEG_E_PIN GPIO_NUM_19
-#define SEG_F_PIN GPIO_NUM_20
-#define SEG_G_PIN GPIO_NUM_21
-#define SEG_DP_PIN GPIO_NUM_22
+#define DISPLAY_DIGITS 5
+#define DISPLAY_REFRESH_US 500
 
-#define COL1_PIN GPIO_NUM_23
-#define COL2_PIN GPIO_NUM_24
-#define COL3_PIN GPIO_NUM_25
-#define COL4_PIN GPIO_NUM_26
-#define COL5_PIN GPIO_NUM_27
+/* UI-V3A C-F hardware mapping. */
+#define PIN_SEG_A GPIO_NUM_7
+#define PIN_SEG_B GPIO_NUM_6
+#define PIN_SEG_C GPIO_NUM_1
+#define PIN_SEG_D GPIO_NUM_0
+#define PIN_SEG_E GPIO_NUM_3
+#define PIN_SEG_F GPIO_NUM_2
+#define PIN_SEG_G GPIO_NUM_9
+#define PIN_SEG_DP GPIO_NUM_10
 
-/* EEPROM/NVS compatibility layer */
-#define EEPROM_NAMESPACE "ui_settings"
-#define EEPROM_KEY "settings"
-#define EEPROM_SIZE 32
+#define PIN_COL1 GPIO_NUM_5
+#define PIN_COL2 GPIO_NUM_4
+#define PIN_COL3 GPIO_NUM_26
+#define PIN_COL4 GPIO_NUM_25
+#define PIN_COL5 GPIO_NUM_24
+#define PIN_BUZZER GPIO_NUM_14
+#define PIN_BLUE_LED GPIO_NUM_23
+#define PIN_TXEN GPIO_NUM_8
 
-static uint8_t eeprom_image[EEPROM_SIZE];
-static bool eeprom_loaded = false;
+/* UI-V3A routes ESP32-C5 U0TXD/U0RXD to RS485. */
+#define ICSC_UART_NUM UART_NUM_0
+#define ICSC_TX_PIN GPIO_NUM_NC
+#define ICSC_RX_PIN GPIO_NUM_NC
 
-static uint32_t millis_ms(void)
+#define BIT_A  (1U << 0)
+#define BIT_B  (1U << 1)
+#define BIT_C  (1U << 2)
+#define BIT_D  (1U << 3)
+#define BIT_E  (1U << 4)
+#define BIT_F  (1U << 5)
+#define BIT_G  (1U << 6)
+#define BIT_DP (1U << 7)
+
+static const gpio_num_t s_segment_pins[8] = {
+    PIN_SEG_A, PIN_SEG_B, PIN_SEG_C, PIN_SEG_D,
+    PIN_SEG_E, PIN_SEG_F, PIN_SEG_G, PIN_SEG_DP,
+};
+
+static const gpio_num_t s_column_pins[DISPLAY_DIGITS] = {
+    PIN_COL1, PIN_COL2, PIN_COL3, PIN_COL4, PIN_COL5,
+};
+
+static icsc_t s_bus;
+static volatile uint8_t s_display_buffer[DISPLAY_DIGITS];
+
+static uint32_t s_last_heartbeat_send_ms;
+static uint32_t s_last_heartbeat_ack_ms;
+static uint32_t s_watchdog_start_ms;
+static bool s_heartbeat_ack_received;
+static bool s_local_e11_active;
+static bool s_showing_e11;
+
+static uint32_t now_ms(void)
 {
     return (uint32_t)(esp_timer_get_time() / 1000ULL);
 }
 
-static void pin_mode(gpio_num_t pin, gpio_mode_t mode)
+static uint8_t glyph_for_char(char c)
 {
-    ESP_ERROR_CHECK(gpio_set_direction(pin, mode));
-}
-
-static void digital_write(gpio_num_t pin, uint32_t level)
-{
-    ESP_ERROR_CHECK(gpio_set_level(pin, level));
-}
-
-static int digital_read(gpio_num_t pin)
-{
-    return gpio_get_level(pin);
-}
-
-static void init_nvs_storage(void)
-{
-    esp_err_t err = nvs_flash_init();
-    if (err == ESP_ERR_NVS_NO_FREE_PAGES || err == ESP_ERR_NVS_NEW_VERSION_FOUND) {
-        ESP_ERROR_CHECK(nvs_flash_erase());
-        err = nvs_flash_init();
-    }
-    ESP_ERROR_CHECK(err);
-
-    nvs_handle_t handle;
-    err = nvs_open(EEPROM_NAMESPACE, NVS_READWRITE, &handle);
-    if (err == ESP_OK) {
-        size_t required_size = EEPROM_SIZE;
-        err = nvs_get_blob(handle, EEPROM_KEY, eeprom_image, &required_size);
-        if (err == ESP_ERR_NVS_NOT_FOUND) {
-            memset(eeprom_image, 0x00, sizeof(eeprom_image));
-            err = nvs_set_blob(handle, EEPROM_KEY, eeprom_image, EEPROM_SIZE);
-            if (err == ESP_OK) {
-                err = nvs_commit(handle);
-            }
-        }
-        nvs_close(handle);
-    }
-    ESP_ERROR_CHECK(err);
-    eeprom_loaded = true;
-}
-
-static uint8_t eeprom_read_byte(uint16_t addr)
-{
-    if (!eeprom_loaded) {
-        return 0;
-    }
-    if (addr >= EEPROM_SIZE) {
-        return 0;
-    }
-    return eeprom_image[addr];
-}
-
-static void eeprom_write_byte(uint16_t addr, uint8_t value)
-{
-    if (!eeprom_loaded) {
-        return;
-    }
-    if (addr >= EEPROM_SIZE) {
-        return;
-    }
-    eeprom_image[addr] = value;
-
-    nvs_handle_t handle;
-    esp_err_t err = nvs_open(EEPROM_NAMESPACE, NVS_READWRITE, &handle);
-    if (err == ESP_OK) {
-        err = nvs_set_blob(handle, EEPROM_KEY, eeprom_image, EEPROM_SIZE);
-        if (err == ESP_OK) {
-            err = nvs_commit(handle);
-        }
-        nvs_close(handle);
-    }
-    if (err != ESP_OK) {
-        ESP_LOGW(TAG, "EEPROM/NVS write failed: %s", esp_err_to_name(err));
+    switch (c) {
+    case '0': return BIT_A | BIT_B | BIT_C | BIT_D | BIT_E | BIT_F;
+    case '1': return BIT_B | BIT_C;
+    case '2': return BIT_A | BIT_B | BIT_D | BIT_E | BIT_G;
+    case '3': return BIT_A | BIT_B | BIT_C | BIT_D | BIT_G;
+    case '4': return BIT_B | BIT_C | BIT_F | BIT_G;
+    case '5': return BIT_A | BIT_C | BIT_D | BIT_F | BIT_G;
+    case '6': return BIT_A | BIT_C | BIT_D | BIT_E | BIT_F | BIT_G;
+    case '7': return BIT_A | BIT_B | BIT_C;
+    case '8': return BIT_A | BIT_B | BIT_C | BIT_D | BIT_E | BIT_F | BIT_G;
+    case '9': return BIT_A | BIT_B | BIT_C | BIT_D | BIT_F | BIT_G;
+    case 'E': return BIT_A | BIT_D | BIT_E | BIT_F | BIT_G;
+    case ' ': return 0;
+    default: return 0;
     }
 }
 
-static void configure_uart_rs485(void)
+static void set_segment(gpio_num_t pin, bool on)
 {
-    uart_config_t uart_config = {
-        .baud_rate = UART_BAUD_RATE,
-        .data_bits = UART_DATA_8_BITS,
-        .parity = UART_PARITY_DISABLE,
-        .stop_bits = UART_STOP_BITS_1,
-        .flow_ctrl = UART_HW_FLOWCTRL_DISABLE,
-        .source_clk = UART_SCLK_DEFAULT,
+    gpio_set_level(pin, on ? 0 : 1); /* segments are active-low */
+}
+
+static void set_column(gpio_num_t pin, bool on)
+{
+    gpio_set_level(pin, on ? 0 : 1); /* columns are active-low/open-drain */
+}
+
+static void all_segments_off(void)
+{
+    for (int i = 0; i < 8; i++) set_segment(s_segment_pins[i], false);
+}
+
+static void all_columns_off(void)
+{
+    for (int i = 0; i < DISPLAY_DIGITS; i++) set_column(s_column_pins[i], false);
+}
+
+static void display_set_raw(uint8_t d0, uint8_t d1, uint8_t d2, uint8_t d3, uint8_t d4)
+{
+    s_display_buffer[0] = d0;
+    s_display_buffer[1] = d1;
+    s_display_buffer[2] = d2;
+    s_display_buffer[3] = d3;
+    s_display_buffer[4] = d4;
+}
+
+static void show_colon(void)
+{
+    display_set_raw(0, 0, BIT_DP, BIT_DP, 0);
+    s_showing_e11 = false;
+}
+
+static void show_e11(void)
+{
+    display_set_raw(0, glyph_for_char('E'), glyph_for_char('1'), glyph_for_char('1'), 0);
+    s_showing_e11 = true;
+}
+
+static void refresh_one_column(int column)
+{
+    uint8_t mask = s_display_buffer[column];
+
+    all_columns_off();
+    all_segments_off();
+
+    for (int seg = 0; seg < 8; seg++) {
+        set_segment(s_segment_pins[seg], (mask & (1U << seg)) != 0);
+    }
+
+    if (mask != 0) {
+        set_column(s_column_pins[column], true);
+    }
+}
+
+static void display_refresh_timer_cb(void *arg)
+{
+    (void)arg;
+    static int column = 0;
+
+    refresh_one_column(column);
+    column = (column + 1) % DISPLAY_DIGITS;
+}
+
+static esp_err_t start_display_refresh_timer(void)
+{
+    const esp_timer_create_args_t timer_args = {
+        .callback = display_refresh_timer_cb,
+        .arg = NULL,
+        .dispatch_method = ESP_TIMER_TASK,
+        .name = "display_refresh",
+        .skip_unhandled_events = true,
     };
 
-    ESP_ERROR_CHECK(uart_driver_install(UART_PORT, 256, 256, 0, NULL, 0));
-    ESP_ERROR_CHECK(uart_param_config(UART_PORT, &uart_config));
-    ESP_ERROR_CHECK(uart_set_pin(UART_PORT, UART_TX_PIN, UART_RX_PIN, UART_PIN_NO_CHANGE, UART_PIN_NO_CHANGE));
-
-    pin_mode(RS485_TXEN_PIN, GPIO_MODE_OUTPUT);
-    digital_write(RS485_TXEN_PIN, 0);
+    esp_timer_handle_t timer;
+    ESP_RETURN_ON_ERROR(esp_timer_create(&timer_args, &timer), TAG, "create display timer");
+    ESP_RETURN_ON_ERROR(esp_timer_start_periodic(timer, DISPLAY_REFRESH_US), TAG, "start display timer");
+    return ESP_OK;
 }
 
-static void configure_gpio(void)
+static void send_heartbeat_to_power_controller(void)
 {
-    pin_mode(S1_ON_OFF_PIN, GPIO_MODE_INPUT);
-    pin_mode(S2_CABIN_LIGHT_PIN, GPIO_MODE_INPUT);
-    pin_mode(S4_STANDBY_PIN, GPIO_MODE_INPUT);
-    pin_mode(S5_DOWN_PIN, GPIO_MODE_INPUT);
-    pin_mode(S6_TEMP_TIME_PIN, GPIO_MODE_INPUT);
-    pin_mode(S7_UP_PIN, GPIO_MODE_INPUT);
-    pin_mode(S3_ADC_PIN, GPIO_MODE_INPUT);
-
-    pin_mode(BUZZER_PIN, GPIO_MODE_OUTPUT);
-    digital_write(BUZZER_PIN, 0);
-
-    pin_mode(SEG_A_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(SEG_B_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(SEG_C_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(SEG_D_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(SEG_E_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(SEG_F_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(SEG_G_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(SEG_DP_PIN, GPIO_MODE_OUTPUT);
-
-    pin_mode(COL1_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(COL2_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(COL3_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(COL4_PIN, GPIO_MODE_OUTPUT);
-    pin_mode(COL5_PIN, GPIO_MODE_OUTPUT);
-
-    digital_write(SEG_A_PIN, 0);
-    digital_write(SEG_B_PIN, 0);
-    digital_write(SEG_C_PIN, 0);
-    digital_write(SEG_D_PIN, 0);
-    digital_write(SEG_E_PIN, 0);
-    digital_write(SEG_F_PIN, 0);
-    digital_write(SEG_G_PIN, 0);
-    digital_write(SEG_DP_PIN, 0);
-    digital_write(COL1_PIN, 1);
-    digital_write(COL2_PIN, 1);
-    digital_write(COL3_PIN, 1);
-    digital_write(COL4_PIN, 1);
-    digital_write(COL5_PIN, 1);
+    char payload[1] = {1};
+    icsc_send(&s_bus, POWER_CONTROLLER_ADDRESS, CMD_HEARTBEAT, sizeof(payload), payload);
+    s_last_heartbeat_send_ms = now_ms();
 }
 
-static void send_rs485_byte(uint8_t byte)
+static void send_heartbeat_ack_to_power_controller(void)
 {
-    digital_write(RS485_TXEN_PIN, 1);
-    uart_write_bytes(UART_PORT, (const char *)&byte, 1);
-    uart_wait_tx_done(UART_PORT, pdMS_TO_TICKS(10));
-    digital_write(RS485_TXEN_PIN, 0);
+    char payload[1] = {1};
+    icsc_send(&s_bus, POWER_CONTROLLER_ADDRESS, CMD_HEARTBEAT_ACK, sizeof(payload), payload);
 }
 
-static void send_heartbeat(void)
+static void mark_communication_alive(void)
 {
-    static uint32_t last_heartbeat_ms = 0;
-    uint32_t now = millis_ms();
-    if (now - last_heartbeat_ms < 1000UL) {
-        return;
+    s_heartbeat_ack_received = true;
+    s_last_heartbeat_ack_ms = now_ms();
+
+    if (s_local_e11_active) {
+        s_local_e11_active = false;
+        show_colon();
     }
-    last_heartbeat_ms = now;
-    send_rs485_byte('H');
-    ESP_LOGD(TAG, "Heartbeat sent over RS485");
 }
 
-static void setup(void)
+static void on_heartbeat_from_power_controller(uint8_t station, char command, uint8_t len, char *data)
 {
-    ESP_LOGI(TAG, "Starting STN UI firmware for ESP32-C5-WROOM-1");
+    (void)command;
+    (void)len;
+    (void)data;
 
-    init_nvs_storage();
-    configure_gpio();
-    configure_uart_rs485();
+    if (station != POWER_CONTROLLER_ADDRESS) return;
 
-    /* Example of reading a persisted value from the old EEPROM layout */
-    uint8_t saved_value = eeprom_read_byte(7);
-    ESP_LOGI(TAG, "Saved EEPROM/NVS byte at address 7 = %u", saved_value);
+    /* Legacy compatibility: old PC builds may send H. Seeing it proves the bus is alive.
+       Replying with h is safe here because this test firmware has no other traffic. */
+    mark_communication_alive();
+    send_heartbeat_ack_to_power_controller();
 }
 
-static void loop(void)
+static void on_heartbeat_ack(uint8_t station, char command, uint8_t len, char *data)
 {
-    send_heartbeat();
+    (void)command;
+    (void)len;
+    (void)data;
 
-    /* Placeholder for the full original UI state machine. */
-    /* The rest of the Arduino logic can be ported into this loop as needed. */
-    vTaskDelay(pdMS_TO_TICKS(10));
+    if (station != POWER_CONTROLLER_ADDRESS) return;
+
+    mark_communication_alive();
+}
+
+static void register_icsc_callbacks(void)
+{
+    icsc_register_command(&s_bus, CMD_HEARTBEAT, on_heartbeat_from_power_controller);
+    icsc_register_command(&s_bus, CMD_HEARTBEAT_ACK, on_heartbeat_ack);
+}
+
+static void update_heartbeat(void)
+{
+    uint32_t now = now_ms();
+    if ((uint32_t)(now - s_last_heartbeat_send_ms) >= HEARTBEAT_INTERVAL_MS) {
+        send_heartbeat_to_power_controller();
+    }
+}
+
+static void trigger_local_e11_communication_error(void)
+{
+    if (s_local_e11_active && s_showing_e11) return;
+
+    s_local_e11_active = true;
+    show_e11();
+    ESP_LOGW(TAG, "E11: no heartbeat ACK from Power Controller");
+}
+
+static void update_ui_communication_watchdog(void)
+{
+    uint32_t now = now_ms();
+    bool communication_lost = false;
+
+    if (!s_heartbeat_ack_received) {
+        if ((uint32_t)(now - s_watchdog_start_ms) >= HEARTBEAT_ACK_TIMEOUT_MS) communication_lost = true;
+    } else if ((uint32_t)(now - s_last_heartbeat_ack_ms) >= HEARTBEAT_ACK_TIMEOUT_MS) {
+        communication_lost = true;
+    }
+
+    if (communication_lost) {
+        trigger_local_e11_communication_error();
+    }
+}
+
+static esp_err_t gpio_init_all(void)
+{
+    uint64_t output_mask = BIT64(PIN_BUZZER) | BIT64(PIN_BLUE_LED) | BIT64(PIN_TXEN);
+    for (int i = 0; i < 8; i++) output_mask |= BIT64(s_segment_pins[i]);
+
+    const gpio_config_t output_cfg = {
+        .pin_bit_mask = output_mask,
+        .mode = GPIO_MODE_OUTPUT,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&output_cfg), TAG, "outputs");
+
+    uint64_t column_mask = 0;
+    for (int i = 0; i < DISPLAY_DIGITS; i++) column_mask |= BIT64(s_column_pins[i]);
+
+    const gpio_config_t column_cfg = {
+        .pin_bit_mask = column_mask,
+        .mode = GPIO_MODE_OUTPUT_OD,
+        .pull_up_en = GPIO_PULLUP_DISABLE,
+        .pull_down_en = GPIO_PULLDOWN_DISABLE,
+        .intr_type = GPIO_INTR_DISABLE,
+    };
+    ESP_RETURN_ON_ERROR(gpio_config(&column_cfg), TAG, "columns");
+
+    all_columns_off();
+    all_segments_off();
+    gpio_set_level(PIN_BUZZER, 0);
+    gpio_set_level(PIN_BLUE_LED, 0);
+    gpio_set_level(PIN_TXEN, 0);
+    return ESP_OK;
 }
 
 void app_main(void)
 {
-    setup();
+    ESP_ERROR_CHECK(gpio_init_all());
+    ESP_ERROR_CHECK(start_display_refresh_timer());
+
+    /* Boot self-test: prove the E11 glyph exists on the seven-segment display. */
+    show_e11();
+    vTaskDelay(pdMS_TO_TICKS(2000));
+    show_colon();
+
+    ESP_ERROR_CHECK(icsc_init(&s_bus, UI_ADDRESS, ICSC_BAUD, ICSC_UART_NUM, ICSC_TX_PIN, ICSC_RX_PIN, PIN_TXEN));
+    register_icsc_callbacks();
+
+    uint32_t now = now_ms();
+    s_watchdog_start_ms = now;
+    s_last_heartbeat_send_ms = now - HEARTBEAT_INTERVAL_MS;
+    s_last_heartbeat_ack_ms = now;
+
+    ESP_LOGI(TAG, "UI-V3A heartbeat test started");
+
     while (true) {
-        loop();
+        icsc_process(&s_bus);
+        update_heartbeat();
+        update_ui_communication_watchdog();
+        vTaskDelay(pdMS_TO_TICKS(5));
     }
 }
