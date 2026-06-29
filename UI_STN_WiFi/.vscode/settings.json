@@ -13,5 +13,6 @@
     "--background-index",
     "--query-driver=**",
     "--compile-commands-dir=c:\\Users\\clayton\\Documents\\GitHub\\STN_UI_V3A\\UI_STN_WiFi\\build"
-  ]
+  ],
+  "idf.portWin": "COM24"
 }
