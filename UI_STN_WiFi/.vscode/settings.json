@@ -1,19 +1,9 @@
 {
-  "C_Cpp.intelliSenseEngine": "default",
-  "idf.extensionActivationMode": "always",
-  "idf.openOcdConfigs": [
-    "board/esp32c5-ftdi.cfg"
-  ],
-  "idf.currentSetup": "C:\\esp\\v5.5.4\\esp-idf",
-  "idf.customExtraVars": {
-    "IDF_TARGET": "esp32c5"
-  },
-  "clangd.path": "C:\\Espressif\\tools\\esp-clang\\esp-19.1.2_20250312\\esp-clang\\bin\\clangd.exe",
-  "clangd.arguments": [
-    "--background-index",
-    "--query-driver=**",
-    "--compile-commands-dir=c:\\Users\\clayton\\Documents\\GitHub\\STN_UI_V3A\\UI_STN_WiFi\\build"
-  ],
-  "idf.portWin": "COM24",
-  "idf.flashType": "UART"
+    "idf.flashType": "UART",
+    "idf.portWin": "COM24",
+    "idf.currentSetup": "C:\\esp\\v5.5.4\\esp-idf",
+    "idf.espIdfPath": "C:\\esp\\v5.5.4\\esp-idf",
+    "idf.pythonBinPath": "C:\\Espressif\\tools\\python\\v5.5.4\\venv\\Scripts\\python.exe",
+    "idf.toolsPath": "C:\\Espressif",
+    "idf.enableCCache": true
 }

@@ -1,0 +1,5933 @@
+/*
+  STN Power Controller - Multiple Steam Generator Build v54
+  Contactor + Auto Fill + Auto Drain + Demand Switch + Illumination
+  Startup Validation + Manual Error Reset + Actual Temperature Display
+
+  MCU:
+    ATmega32 / ATmega32A, TQFP44
+
+  Arduino Core:
+    MightyCore
+
+  Required Arduino IDE / MightyCore settings:
+    Board  : ATmega32
+    Pinout : Sanguino
+    Clock  : 16 MHz external
+    Upload : Upload Using Programmer / ISP
+
+  Board:
+    SAWO / STN Power Controller Board
+
+  Implemented:
+    - PB7 / SCK LED blinking = Power Controller alive indicator
+    - PA6 / LEVEL_SENS1 = probe common/reference
+    - PA7 / LEVEL_SENS2 = Probe 1 / highest water level
+    - PC7 / LEVEL_SENS3 = Probe 2 / fill stop level
+    - PC6 / LEVEL_SENS4 = Probe 3 / minimum safe level / contactor enable
+    - PB0 = Contactor output
+    - PA3 = Auto Fill output
+    - E1 to E10 error detection
+    - ICSC communication at 57600 baud
+
+  Probe mapping:
+    PA6 = LEVEL_SENS1 = common/reference
+    PA7 = LEVEL_SENS2 = Probe 1 / highest water level
+    PC7 = LEVEL_SENS3 = Probe 2 / fill stop level
+    PC6 = LEVEL_SENS4 = Probe 3 / minimum safe water level
+
+  Error list:
+    E1  = Temperature sensor 1 not connected
+    E2  = Temperature sensor 1 short circuit
+    E3  = Temperature sensor 2 not connected
+    E4  = Temperature sensor 2 short circuit
+    E5  = Temperature fuse defect
+    E6  = Water level 1 reached and not permitted / water too high
+    E7  = Water below level 3 for more than 300 seconds
+    E8  = Illogical water-level combination
+    E9  = Fill failure
+    E10 = Drain/fill function failure
+    E11 = UI communication failure
+    E12 = Over-temperature
+    E13 = Generator chain / master-slave acknowledgement failure
+
+  Error behavior:
+    - Error priority: E12 > E11 > E5 > E13 > E10 > E8 > E6 > E7 > E9 > E3 > E4 > E1 > E2.
+    - E12 can override an already latched lower-priority error.
+    - E1-E13 use the configured confirmation delay before becoming active.
+    - Current ERROR_CONFIRM_DELAY_MS = 1000 ms.
+    - E7/E9/E10 still use their internal 300-second water/drain timers.
+    - If the error condition is solved, the error state returns to OFF.
+    - During pending or active error, dangerous outputs are forced OFF.
+    - Errors are sent to the User Interface through ICSC.
+    - PB7 LED normal blink while MCU runs; fast blink during pending/active error.
+
+  TEMP_FUSE behavior:
+    Reference-style sampled digital filter.
+    PA4 HIGH samples -> fuse OK
+    PA4 LOW/no OK samples -> E5 after filtered confirmation
+
+  Current system settings:
+    REQUIRE_UI_POWER_ON  = 1
+    REQUIRE_UI_HEARTBEAT = 0
+
+  Later, when heartbeat testing is finalized:
+    REQUIRE_UI_HEARTBEAT = 1
+*/
+
+
+/*
+  NOTE:
+    This version is reorganized for readability only.
+    Functional logic is kept the same from the uploaded latest draft.
+    Main grouping:
+      - Communication definitions
+      - System settings
+      - Pin definitions
+      - Feature settings
+      - State variables
+      - Functions grouped by feature: Fan, Scent Pump, Cabin Light, Auto Drain, Faults, ICSC
+*/
+
+#include <Arduino.h>
+#include <avr/io.h>
+#include <avr/interrupt.h>
+#include <util/atomic.h>
+#include <math.h>
+
+
+// ======================================================
+// ICSC ENABLE
+// ======================================================
+
+#define ENABLE_ICSC 1
+
+#if ENABLE_ICSC
+#include <ICSC.h>
+#include <EEPROM.h>
+#endif
+
+// ======================================================
+// TIMER2 PHASE-CONTROL NOTE
+// ======================================================
+
+/*
+  Cabin-light dimming must use the reference-style method:
+    - Timer2 compare interrupt runs every 75 us.
+    - FNET is sampled/polled inside the Timer2 ISR.
+    - PC1 / CABLIGHT is turned ON after the phase threshold and turned OFF
+      near the next zero-cross.
+
+  The older INT0 + Timer1 one-shot dimmer method is removed here because
+  it caused flicker on this hardware.
+*/
+
+// ======================================================
+// ICSC COMMUNICATION SETTINGS
+// ======================================================
+
+#define UI_ADDRESS 1
+#define POWER_CONTROLLER_ADDRESS 2
+#define ICSC_BAUD 57600UL
+
+/*
+  ICSC.begin(address, 57600, &Serial, 5);
+
+  IMPORTANT for MightyCore:
+    Pinout must be Sanguino.
+
+  RS485_DE_PIN is an Arduino digital pin number, not a port bit.
+  In MightyCore Sanguino TQFP44 mapping:
+    Arduino D5 = PB5 = MOSI_TXEN / RS-485 DE/TXEN.
+*/
+#define RS485_DE_PIN 5
+
+// ICSC command map
+#define CMD_HEARTBEAT 'H'      // UI -> Power Controller
+#define CMD_HEARTBEAT_ACK 'h'  // Power Controller -> UI
+
+#define CMD_POWER_ON 'P'      // UI -> Power Controller
+#define CMD_POWER_ON_ACK 'p'  // Power Controller -> UI
+
+#define CMD_POWER_OFF 'X'  // UI -> Power Controller
+
+#define CMD_STATUS_REQUEST 'Q'  // UI -> Power Controller
+#define CMD_STATUS_REPLY 'S'    // Power Controller -> UI
+
+#define CMD_VERSION_REQUEST 'V'  // UI -> Power Controller
+#define CMD_VERSION_REPLY 'v'    // Power Controller -> UI
+
+#define CMD_TEMPERATURES 'T'  // Power Controller -> UI
+
+#define CMD_ERROR_REPORT 'E'  // Power Controller -> UI
+
+#define CMD_DIP_REQUEST 'D'  // UI -> Power Controller
+#define CMD_DIP_REPLY 'd'    // Power Controller -> UI
+
+#define CMD_GENERATOR_PRESENCE 'G'      // PC -> PC poll/presence
+#define CMD_GENERATOR_PRESENCE_ACK 'g'  // PC -> PC status/ack
+#define CMD_SLAVE_STATUS_REQUEST 'Z'    // UI -> Master PC: service status request
+#define CMD_SLAVE_STATUS_REPLY 'z'      // Master PC -> UI: service status reply
+#define CMD_SLAVE_SERVICE_SET 'O'       // UI -> Master PC: set selected slave OK/OF
+#define CMD_SLAVE_SERVICE_ACK 'o'       // Master PC -> UI: service set acknowledgement
+
+#define CMD_SET_OPERATION_MODE 'M'  // UI -> Power Controller
+
+#define CMD_SCENT_PUMP_SETPOINT 'N'  // UI -> Power Controller
+#define CMD_SCENT_PUMP_STATUS 'n'    // Power Controller -> UI
+
+#define CMD_DRAIN_FILL_START 'A'  // UI -> Power Controller
+#define CMD_DRAIN_FILL_STOP 'a'   // UI -> Power Controller
+
+#define CMD_FAN_CONTROL 'F'  // UI -> Power Controller
+#define CMD_FAN_STATUS 'f'   // Power Controller -> UI
+
+#define CMD_CABIN_LIGHT_SETPOINT 'C'  // UI -> Power Controller
+#define CMD_CABIN_LIGHT_STATUS 'c'    // Power Controller -> UI
+
+#define CMD_DEMAND_ILLUMINATION 'I'  // UI -> Power Controller: 0=Off, 1=Slow, 2=Fast, 3=On
+
+#define CMD_UI_SETTINGS 'U'      // UI -> Power Controller: target temp + session time + standby time
+#define CMD_UI_SETTINGS_ACK 'u'  // Power Controller -> UI
+
+#define ERROR_SEND_INTERVAL_MS 5000UL
+
+
+// ======================================================
+// SOFTWARE VERSION
+// ======================================================
+
+#define PC_VERSION_MAJOR 1
+#define PC_VERSION_MINOR 9
+
+
+// ======================================================
+// BENCH / SYSTEM CONTROL SETTINGS
+// ======================================================
+
+/*
+  0 = bench mode. Power Controller runs automatically.
+  1 = final mode. Power Controller waits for UI POWER ON command.
+*/
+#define REQUIRE_UI_POWER_ON 1
+
+/*
+  0 = bench mode. UI heartbeat not required.
+  1 = final mode. Missing UI heartbeat stops outputs.
+*/
+#define REQUIRE_UI_HEARTBEAT 1
+
+#define COMM_TIMEOUT_MS 10000UL
+/*
+  Half-duplex RS485 heartbeat:
+    UI is master and sends CMD_HEARTBEAT every 1 second.
+    Power Controller replies with CMD_HEARTBEAT_ACK.
+
+  The Power Controller does not send independent periodic heartbeat requests.
+*/
+#define BIDIRECTIONAL_HEARTBEAT_INTERVAL_MS 1000UL
+
+
+// ======================================================
+// HARDWARE CONFIGURATION
+// ======================================================
+
+#define PROBE_COMMON_ACTIVE_HIGH 1
+#define SENSOR_ACTIVE_HIGH 1
+
+#define OUTPUT_ACTIVE_HIGH 1
+
+#define LED_ACTIVE_HIGH 1
+#define ALIVE_LED_INTERVAL_MS 500UL
+#define ERROR_LED_INTERVAL_MS 200UL
+
+/*
+  Probe stability filter.
+
+  The reference steam-generator code confirms water level changes using time,
+  not instant raw readings. We use the same idea here for the three discrete
+  tank probes.
+
+  ON confirmation:
+    raw probe must stay ON for this time before stable state becomes ON.
+
+  OFF confirmation:
+    raw probe must stay OFF for this time before stable state becomes OFF.
+*/
+#define PROBE_ON_CONFIRM_MS 500UL
+#define PROBE_OFF_CONFIRM_MS 500UL
+
+
+// ======================================================
+// DIP SWITCH / TIME SETTINGS
+// ======================================================
+
+// Special value for unlimited time.
+#define TIME_UNLIMITED 0xFFFF
+
+// Time adjustment step from spec.
+#define TIME_STEP_MINUTES 5
+
+// Minimum allowed SessionTime and StandbyTime.
+#define MIN_SESSION_TIME_MIN 5
+#define MIN_STANDBY_TIME_MIN 5
+
+// Countdown timing for Session and Standby timers.
+// Use 60000 ms for normal operation. For bench testing, this can be reduced temporarily.
+#define SESSION_STANDBY_COUNTDOWN_TICK_MS 1000UL
+
+/*
+  DIP block 2 functions from spec:
+
+  SW1 = Disable standby mode, ON = standby disabled
+  SW2-SW5 = Max session time
+  SW6-SW8 = Standby mode duration
+*/
+
+
+// ======================================================
+// ERROR TIMING
+// ======================================================
+
+#define ERROR_CONFIRM_DELAY_MS 1000UL
+#define ERROR_NORMAL_DELAY_MS ERROR_CONFIRM_DELAY_MS
+#define ERROR_E5_DELAY_MS ERROR_CONFIRM_DELAY_MS
+#define ERROR_E12_DELAY_MS ERROR_CONFIRM_DELAY_MS
+
+// E12 over-temperature margin.
+// Current rule: max temperature + 10°C
+#define E12_OVER_TEMP_MARGIN_C 10
+#define WATER_TIMEOUT_MS 300000UL  // 300 seconds
+
+// ======================================================
+// AUTO DRAIN SETTINGS
+// ======================================================
+
+// Maximum time allowed to fill tank up to Probe 1 before drain starts.
+#define AUTODRAIN_FILL_TIMEOUT_MS 300000UL  // 300 seconds
+
+// Drain valve open duration.
+#define AUTODRAIN_DRAIN_TIME_MS 600000UL  // 10 minutes
+
+/*
+  NTC ADC thresholds.
+
+  Assumption:
+    NTC open / not connected -> ADC near 1023
+    NTC short circuit        -> ADC near 0
+
+  Adjust later after measuring real ADC values.
+*/
+#define NTC_OPEN_THRESHOLD 1000
+#define NTC_SHORT_THRESHOLD 20
+
+/*
+  NTC ADC averaging based on the original Steam Generator reference code.
+
+  The original code accumulates 300 readings before deciding E3/E4.
+  This prevents a floating/noisy ADC node or one bad conversion from
+  immediately triggering NTC2 open/short errors.
+*/
+#define NTC_AVERAGE_SAMPLE_COUNT 300U
+
+/*
+  TEMP_FUSE / E5 reference-style sampled filter.
+
+  Based on the other steam-generator variant:
+    digitalRead(tempFusePin) HIGH = fuse OK
+    digitalRead(tempFusePin) LOW  = fuse fault / E5
+
+  The old reference sampled about 100 times and required more than
+  10 HIGH readings to consider the fuse OK.
+
+  This version uses a non-blocking millis() filter:
+    100 samples x 10 ms = about 1 second sample window
+    at least 11 OK/HIGH samples = fuse OK
+*/
+#define TEMP_FUSE_OK_ACTIVE_HIGH 1
+#define TEMP_FUSE_SAMPLE_INTERVAL_MS 10UL
+#define TEMP_FUSE_SAMPLE_COUNT 100
+#define TEMP_FUSE_MIN_OK_SAMPLES 11
+
+// ======================================================
+// GENERATOR CHAIN / E13 SETTINGS
+// ======================================================
+
+// Multiple steam-generator chain settings.
+#define MAX_GENERATOR_SLAVES 7
+#define GENERATOR_MASTER_ADDRESS POWER_CONTROLLER_ADDRESS
+#define GENERATOR_SLAVE_BASE_ADDRESS POWER_CONTROLLER_ADDRESS
+
+// Master polls one slave every 200 ms. Full S1-S7 scan is about 1.4 s.
+#define GENERATOR_SLAVE_POLL_INTERVAL_MS 200UL
+
+// Startup discovery window. Missing slaves during this window are ignored for this power cycle.
+#define GENERATOR_STARTUP_DISCOVERY_MS 3000UL
+
+// If an active slave disappears after startup, raise Sx/E13 after 10 seconds.
+// This also gives slave boards a longer no-Master communication timeout.
+#define GENERATOR_PRESENCE_TIMEOUT_MS 10000UL
+
+// EEPROM bytes used by the Master to remember intentionally excluded slaves.
+#define EEPROM_ADDR_QUARANTINED_SLAVE_MASK 20
+#define EEPROM_ADDR_MANUAL_DISABLED_SLAVE_MASK 21
+#define EEPROM_ADDR_SLAVE_ERROR_BASE 22  // 22..29, index by slave ID 1..7
+
+// ======================================================
+// DIP4 TEMPERATURE RANGE SETTINGS
+// ======================================================
+
+// U6 DIP4 OFF = max temperature 50°C
+// U6 DIP4 ON  = max temperature 55°C
+#define MAX_TEMP_LOW_RANGE_C 50
+#define MAX_TEMP_HIGH_RANGE_C 55
+#define MIN_TARGET_TEMP_C 30
+
+// Current maximum temperature selected by U6 DIP4.
+// Default is 50°C until U6 DIP switches are read.
+static int16_t maxTempC = MAX_TEMP_LOW_RANGE_C;
+
+// E12 delay based on old reference code behavior.
+
+// ======================================================
+// TEMPERATURE CONTROL SETTINGS
+// ======================================================
+
+// For bench testing only.
+// Later, the User Interface will send the user set temperature.
+static int16_t sessionSetPointC = 40;
+
+// Session mode control using NTC1.
+// User interface has no decimal point, so we use ±1°C hysteresis.
+// Example setpoint 40°C:
+//   > 41°C = Contactor OFF
+//   < 39°C = Contactor ON
+#define SESSION_TEMP_HYSTERESIS_C 1
+
+// Standby mode control using NTC2.
+// Official spec:
+//   > 87°C = Contactor OFF
+//   < 83°C = Contactor ON
+#define STANDBY_TEMP_ON_C 83
+#define STANDBY_TEMP_OFF_C 87
+
+// Minimum time between normal contactor switching actions.
+#define CONTACTOR_MIN_ACTION_INTERVAL_MS 30000UL
+
+// ======================================================
+// DEMAND SWITCH / ILLUMINATION SETTINGS
+// ======================================================
+
+/*
+  Demand switch feature:
+    - PA5 / ADC5 = DEMAND_SW input.
+    - PB6 / MISO = illuminated-ring LED output driver.
+
+  Input circuit from schematic:
+    +12 V pull-up through R27 and series R26 to PA5.
+    Pressing the piezo switch pulls the sensed node LOW.
+*/
+#define DEMAND_SW_ACTIVE_LOW 1
+#define DEMAND_SW_DEBOUNCE_MS 20UL
+
+/*
+  Demand boost / final Demand Switch logic:
+    OFF state:
+      Demand Switch short press = ON / Session mode.
+
+    Session Time state:
+      If actual cabin temperature is greater than target temperature,
+      Demand Switch press forces the contactor ON for 30 seconds.
+
+      If actual temperature is NOT greater than target temperature,
+      Demand Switch press does nothing. It must NOT change to Standby.
+
+    Standby Time state:
+      Demand Switch press changes Standby -> Session.
+*/
+#define DEMAND_HEAT_BOOST_MS 30000UL
+
+/*
+  Final state-based illumination logic from specification/screenshots:
+    Startup/version display = steady ON for 2 seconds
+    After version display   = OFF for 0.5 second
+    OFF state               = slow blink, 1 s OFF / 1 s ON
+    Session Time / ON state = steady ON
+    Standby Time state      = slow blink, 1 s OFF / 1 s ON
+    Drain state             = OFF
+
+  Demand Switch press feedback:
+    Any Demand Switch press outside Drain State forces Fast blink for 2 seconds.
+    During Drain State, Demand Switch is ignored and illumination remains OFF.
+*/
+#define DEMAND_ILLUMINATION_ACTIVE_HIGH 1
+#define DEMAND_ILLUMINATION_STARTUP_ON_MS 2000UL
+#define DEMAND_ILLUMINATION_AFTER_STARTUP_OFF_MS 500UL
+#define DEMAND_ILLUMINATION_SLOW_ON_MS 1000UL
+#define DEMAND_ILLUMINATION_SLOW_OFF_MS 1000UL
+#define DEMAND_ILLUMINATION_FAST_ON_MS 50UL
+#define DEMAND_ILLUMINATION_FAST_OFF_MS 50UL
+#define DEMAND_ILLUMINATION_PRESS_OVERRIDE_MS 2000UL
+
+// ======================================================
+// STARTUP / OFF-STATE FAULT VALIDATION SETTINGS
+// ======================================================
+
+/*
+  Startup validation runs while the UI is showing the version numbers.
+
+  Purpose:
+    - Let NTC1/NTC2 ADC averaging become valid.
+    - Let TEMP_FUSE filtering become valid.
+    - Let water probe filters and DIP settings settle.
+    - Prevent ON acceptance before physical safety inputs are validated.
+
+  OFF-state validation:
+    - When the user manually goes OFF after an error, the Power Controller
+      continues checking the physical fault condition while OFF.
+    - If the physical fault is fixed while OFF, the stored/latched error clears.
+    - If the physical fault is still present, the error remains stored and the
+      next S6/ON request is rejected.
+*/
+#define STARTUP_FAULT_VALIDATION_MIN_MS 2500UL
+
+
+// ======================================================
+// PIN DEFINITIONS - HARDWARE MAP
+// ======================================================
+
+// ------------------------------------------------------
+// WATER PROBE PINS
+// ------------------------------------------------------
+
+// Probe common/reference
+#define PROBE_COMMON_DDR DDRA
+#define PROBE_COMMON_PORT PORTA
+#define PROBE_COMMON_PIN PA6  // LEVEL_SENS1
+
+// Probe 1 / highest water level
+#define PROBE1_DDR DDRA
+#define PROBE1_PORT PORTA
+#define PROBE1_PINREG PINA
+#define PROBE1_PIN PA7  // LEVEL_SENS2
+
+// Probe 2 / fill stop level
+#define PROBE2_DDR DDRC
+#define PROBE2_PORT PORTC
+#define PROBE2_PINREG PINC
+#define PROBE2_PIN PC7  // LEVEL_SENS3
+
+// Probe 3 / minimum safe level
+#define PROBE3_DDR DDRC
+#define PROBE3_PORT PORTC
+#define PROBE3_PINREG PINC
+#define PROBE3_PIN PC6  // LEVEL_SENS4
+
+// ------------------------------------------------------
+// MAIN OUTPUT PINS
+// ------------------------------------------------------
+
+// Outputs
+#define CONTACTOR_DDR DDRB
+#define CONTACTOR_PORT PORTB
+#define CONTACTOR_PIN PB0  // CONTACTOR
+
+#define AUTOFILL_DDR DDRA
+#define AUTOFILL_PORT PORTA
+#define AUTOFILL_PIN PA3  // AUTOFILL
+
+#define AUTODRAIN_DDR DDRA
+#define AUTODRAIN_PORT PORTA
+#define AUTODRAIN_PIN PA2  // AUTODRAIN
+
+// ------------------------------------------------------
+// SCENT PUMP / DIP6 OUTPUT PIN
+// ------------------------------------------------------
+
+// Scent pump output
+// Confirm this pin with the schematic. We are using PC0 based on our current mapping.
+#define SCENT_PUMP_DDR DDRC
+#define SCENT_PUMP_PORT PORTC
+#define SCENT_PUMP_PIN PC0
+
+// Power Controller alive LED
+#define LED_DDR DDRB
+#define LED_PORT PORTB
+#define LED_PIN PB7  // SCK LED
+
+// ------------------------------------------------------
+// DEMAND SWITCH / ILLUMINATION PINS
+// ------------------------------------------------------
+
+#define DEMAND_SW_DDR DDRA
+#define DEMAND_SW_PORT PORTA
+#define DEMAND_SW_PINREG PINA
+#define DEMAND_SW_PIN PA5  // DEMAND_SW / ADC5
+
+#define DEMAND_ILLUMINATION_DDR DDRB
+#define DEMAND_ILLUMINATION_PORT PORTB
+#define DEMAND_ILLUMINATION_PIN PB6  // MISO / Demand Switch illumination LED driver
+
+// ------------------------------------------------------
+// ERROR SENSOR / ADC INPUT PINS
+// ------------------------------------------------------
+
+// Error sensor inputs
+#define TEMP_FUSE_DDR DDRA
+#define TEMP_FUSE_PORT PORTA
+#define TEMP_FUSE_PINREG PINA
+#define TEMP_FUSE_PIN PA4  // TEMP_FUSE
+
+#define ADC_NTC1_CHANNEL 0  // PA0 / ADC0 / NTC1
+#define ADC_NTC2_CHANNEL 1  // PA1 / ADC1 / NTC2
+
+// ------------------------------------------------------
+// FAN / DIP7 OUTPUT PIN
+// ------------------------------------------------------
+
+// Fan output
+#define FAN_DDR DDRD
+#define FAN_PORT PORTD
+#define FAN_PIN PD7
+
+// ======================================================
+// CABIN LIGHT / DIMMER PINS
+// ======================================================
+
+// Cabin light output
+#define CABIN_LIGHT_DDR DDRC
+#define CABIN_LIGHT_PORT PORTC
+#define CABIN_LIGHT_PIN PC1  // CABLIGHT
+
+// AC timing / zero-cross reference
+#define FNET_DDR DDRD
+#define FNET_PORT PORTD
+#define FNET_PINREG PIND
+#define FNET_PIN PD2  // FNET / INT0
+
+// Cabin light dimmer timing settings are declared later in:
+//   CABIN LIGHT / DIP8 DIMMER SETTINGS
+
+// ======================================================
+// DIP SWITCH MATRIX PINS
+// ======================================================
+
+/*
+  DIP switch matrix from schematic:
+
+  ROW1 = PB1 / RDW1
+  ROW2 = PB2 / RDW2
+  ROW3 = PB3 / RDW3
+  ROW4 = PB4 / RDW4
+
+  COL1 = PD4
+  COL2 = PD3
+  COL3 = PD6
+  COL4 = PD5
+*/
+
+// Rows / RDW pins
+#define DIP_ROW_DDR DDRB
+#define DIP_ROW_PORT PORTB
+#define DIP_ROW_PINREG PINB
+
+#define DIP_ROW1_PIN PB1  // RDW1
+#define DIP_ROW2_PIN PB2  // RDW2
+#define DIP_ROW3_PIN PB3  // RDW3
+#define DIP_ROW4_PIN PB4  // RDW4
+
+// Columns
+#define DIP_COL_DDR DDRD
+#define DIP_COL_PORT PORTD
+
+#define DIP_COL1_PIN PD4  // COL1
+#define DIP_COL2_PIN PD3  // COL2
+#define DIP_COL3_PIN PD6  // COL3
+#define DIP_COL4_PIN PD5  // COL4
+
+/*
+  Assumption:
+    Active column HIGH.
+    Closed DIP switch makes row HIGH.
+
+  If DIP readings are inverted during testing, change DIP_SWITCH_ACTIVE_HIGH to 0.
+*/
+#define DIP_COLUMN_ACTIVE_HIGH 1
+#define DIP_SWITCH_ACTIVE_HIGH 1
+
+
+// ======================================================
+// FAULT DEFINITIONS
+// ======================================================
+
+enum FaultCode {
+  FAULT_NONE = 0,
+
+  FAULT_E1_NTC1_OPEN = 1,
+  FAULT_E2_NTC1_SHORT = 2,
+  FAULT_E3_NTC2_OPEN = 3,
+  FAULT_E4_NTC2_SHORT = 4,
+  FAULT_E5_TEMP_FUSE = 5,
+
+  FAULT_E6_WATER_TOO_HIGH = 6,
+  FAULT_E7_WATER_TOO_LOW = 7,
+  FAULT_E8_LEVEL_LOGIC = 8,
+  FAULT_E9_FILL_FAILURE = 9,
+  FAULT_E10_DRAIN_FAILURE = 10,
+  // E11 will be communication failure between UI and Power Controller.
+  FAULT_E11_COMMUNICATION = 11,
+
+  FAULT_E12_OVER_TEMP = 12,
+
+  // E13 = No master/other steam generator board detected or incorrect chain setting.
+  FAULT_E13_NO_GENERATOR_CHAIN = 13
+};
+
+static FaultCode activeFault = FAULT_NONE;
+static FaultCode pendingFault = FAULT_NONE;
+
+static unsigned long pendingFaultStartTime = 0;
+static unsigned long lastErrorSendTime = 0;
+
+
+// ======================================================
+// SYSTEM STATE VARIABLES
+// ======================================================
+
+static bool operationEnabled = false;
+/*
+  Tracks the UI requested state.
+  This stays true after the user presses S6/ON, even if a fault later forces
+  operationEnabled false. It lets the cabin light turn ON during errors only
+  when the UI has attempted/entered ON state, not during normal OFF state.
+*/
+static bool uiRequestedOnState = false;
+
+static unsigned long lastHeartbeatTime = 0;
+static unsigned long lastHeartbeatSendTime = 0;
+static bool communicationFault = false;
+
+// Startup/off-state fault validation timer.
+static unsigned long controllerStartupTime = 0;
+
+// ======================================================
+// FAN / DIP7 STATE VARIABLES
+// ======================================================
+
+static bool fanRequested = false;
+
+// ======================================================
+// GENERATOR CHAIN / U6 DIP SWITCH VARIABLES
+// ======================================================
+
+enum GeneratorRole {
+  GENERATOR_ROLE_MASTER = 0,
+  GENERATOR_ROLE_SLAVE = 1
+};
+
+// U6 DIP block raw value.
+static uint8_t dipBlock1Value = 0;
+
+/*
+  Multiple steam-generator addressing:
+    DIP1 DIP2 DIP3 = 000 -> Master, always connected to UI.
+    DIP1 DIP2 DIP3 = 001 -> Slave 1
+    DIP1 DIP2 DIP3 = 010 -> Slave 2
+    ...
+    DIP1 DIP2 DIP3 = 111 -> Slave 7
+
+  The UI-connected board must be 000. If it is accidentally set to any non-zero
+  address, the board behaves as a Slave and will trigger E13 when no Master is
+  detected.
+*/
+static uint8_t generatorNodeId = 0;  // 0 = Master, 1..7 = Slave number.
+static bool generatorChainModeSelected = true;
+
+// Generator-chain role. This is different from UI/Power Controller ICSC master/slave.
+static GeneratorRole generatorRole = GENERATOR_ROLE_MASTER;
+static uint8_t generatorSlaveNumber = 0;
+
+// Local ICSC station address: Master = 2, Slave1 = 3, ... Slave7 = 9.
+static uint8_t localIcscAddress = POWER_CONTROLLER_ADDRESS;
+
+// Master-side slave masks. Bit0 = S1, bit6 = S7.
+static uint8_t startupDetectedSlaveMask = 0;
+static uint8_t quarantinedSlaveMask = 0;
+static uint8_t manualDisabledSlaveMask = 0;
+static uint8_t activeSlaveMask = 0;
+static uint8_t runtimeLostSlaveMask = 0;
+
+// Saved/current error code per slave index 1..7.
+static uint8_t savedSlaveErrorCode[MAX_GENERATOR_SLAVES + 1] = {0};
+static uint8_t currentSlaveErrorCode[MAX_GENERATOR_SLAVES + 1] = {0};
+static unsigned long lastSlaveSeenTime[MAX_GENERATOR_SLAVES + 1] = {0};
+
+static uint8_t currentSlavePollId = 1;
+static unsigned long lastGeneratorPresenceSendTime = 0;
+static bool masterDiscoveryComplete = false;
+static unsigned long masterDiscoveryStartTime = 0;
+
+// Slave-side master detection.
+static bool generatorMasterDetected = false;
+static unsigned long lastGeneratorMasterSeenTime = 0;
+static bool slaveAcceptedMasterOperation = false;
+static bool masterHeatPermissionFromChain = false;
+
+// Active slave error latched by the Master for UI display Sx -> Ex.
+static bool activeSlaveFaultFromChain = false;
+static uint8_t activeSlaveFaultId = 0;
+static uint8_t activeSlaveFaultError = 0;
+
+// Generic detection retained for diagnostics.
+static bool otherPowerControllerDetected = false;
+static unsigned long lastOtherPowerControllerSeenTime = 0;
+
+// E13 DIP/role validation is not used in the final address model.
+static bool generatorDipSettingInvalid = false;
+
+// Time when the current generator-chain role/DIP configuration became active.
+static unsigned long generatorChainModeStartTime = 0;
+
+// Optional features from U6.
+static bool fanEnabledByDip = false;
+static bool scentPumpEnabledByDip = false;
+static bool autoDrainEnabledByDip = false;
+static bool temperatureRangeHighByDip = false;
+
+// ======================================================
+// SESSION / STANDBY TIME VARIABLES
+// ======================================================
+
+static uint8_t dipBlock2Value = 0;
+
+static bool standbyDisabledByDip = false;
+
+static uint16_t maxSessionTimeMin = 10;
+static uint16_t maxStandbyTimeMin = 240;
+
+static uint16_t startSessionTimeMin = 10;
+static uint16_t sessionTimeMin = 10;  // Remaining session time rounded up to minutes.
+static uint32_t sessionRemainingSeconds = 10UL * 60UL;
+
+static uint16_t startStandbyTimeMin = 240;
+static uint16_t standbyTimeMin = 240;  // Remaining standby time rounded up to minutes.
+static uint32_t standbyRemainingSeconds = 240UL * 60UL;
+
+static unsigned long lastSessionCountdownTickTime = 0;
+static unsigned long lastStandbyCountdownTickTime = 0;
+
+// ======================================================
+// OPERATION MODE / TEMPERATURE CONTROL STATE
+// ======================================================
+
+enum OperationMode {
+  MODE_SESSION = 0,
+  MODE_STANDBY = 1
+};
+
+// For now, default to session mode.
+// Later, the UI will command Session or Standby mode.
+static OperationMode operationMode = MODE_SESSION;
+
+// True means the temperature controller wants the contactor ON.
+static bool temperatureHeatDemand = false;
+
+// Software-tracked normal contactor state.
+static bool normalContactorState = false;
+
+// Last time the contactor changed due to normal temperature control.
+static unsigned long lastNormalContactorActionTime = 0;
+
+// ======================================================
+// DEMAND SWITCH / ILLUMINATION STATE VARIABLES
+// ======================================================
+
+static bool demandSwitchStablePressed = false;
+static bool demandSwitchLastRawPressed = false;
+static unsigned long demandSwitchLastChangeTime = 0;
+static bool demandSwitchPressEvent = false;
+
+static bool demandHeatBoostActive = false;
+static unsigned long demandHeatBoostStartTime = 0;
+
+enum DemandIlluminationMode {
+  DEMAND_ILLUMINATION_OFF = 0,
+  DEMAND_ILLUMINATION_SLOW = 1,
+  DEMAND_ILLUMINATION_FAST = 2,
+  DEMAND_ILLUMINATION_ON = 3
+};
+
+static DemandIlluminationMode demandIlluminationMode = DEMAND_ILLUMINATION_OFF;
+static bool demandIlluminationOutputState = false;
+static unsigned long lastDemandIlluminationToggleTime = 0;
+static unsigned long demandIlluminationFastOverrideUntilTime = 0;
+static bool demandIlluminationStartupSequenceActive = true;
+static unsigned long demandIlluminationStartupSequenceStartTime = 0;
+
+// ======================================================
+// LED VARIABLES
+// ======================================================
+
+static unsigned long lastAliveLedToggleTime = 0;
+static bool aliveLedState = false;
+
+// ======================================================
+// TEMP_FUSE / E5 FILTER VARIABLES
+// ======================================================
+
+static unsigned long lastTempFuseSampleTime = 0;
+static uint8_t tempFuseSampleIndex = 0;
+static uint8_t tempFuseOkSampleCount = 0;
+static bool tempFuseFilteredOk = true;
+static bool tempFuseWindowReady = false;
+
+// ======================================================
+// WATER-LEVEL TIMER VARIABLES
+// ======================================================
+
+/*
+  E7:
+    Probe 3 / PC6 must detect water within 300 seconds after system ON.
+*/
+static unsigned long waterBelowProbe3StartTime = 0;
+static bool waterBelowProbe3TimerRunning = false;
+
+/*
+  E9:
+    During normal filling, Probe 2 / PC7 must detect water within 300 seconds
+    after Probe 3 / PC6 has already detected water.
+*/
+static unsigned long fillToProbe2StartTime = 0;
+static bool fillToProbe2TimerRunning = false;
+
+/*
+  E10:
+    During future drain/fill function, Probe 1 / PA7 must be reached within
+    300 seconds.  
+*/
+
+// ======================================================
+// SCENT PUMP / DIP6 STATE VARIABLES
+// ======================================================
+
+// Set by User Interface later.
+// 0 = OFF, 1-19 = interval mode, 20 = continuous ON.
+static uint8_t scentPumpSetPoint = 0;
+
+// Start time of current scent pump cycle.
+static unsigned long scentPumpCycleStartTime = 0;
+
+// Actual scent pump output state.
+static bool scentPumpOutputState = false;
+
+// ======================================================
+// AUTO DRAIN STATE VARIABLES
+// ======================================================
+
+enum AutoDrainState {
+  AUTODRAIN_IDLE = 0,
+  AUTODRAIN_FILL_TO_PROBE1,
+  AUTODRAIN_DRAINING
+};
+
+static AutoDrainState autoDrainState = AUTODRAIN_IDLE;
+
+/*
+  Drain preparation fill latch.
+  Once fill is requested during the drain-preparation stage, keep filling
+  until Probe 1 / PA7 is detected. This prevents Auto Fill relay chatter
+  around Probe 2 / PC7.
+*/
+static bool standbyTimeoutDrainStarted = false;
+static bool autoDrainFillStarted = false;
+
+static unsigned long autoDrainFillStartTime = 0;
+static unsigned long autoDrainDrainStartTime = 0;
+
+/*
+  Drain success latch.
+
+  New final drain rule:
+    - During AUTODRAIN_DRAINING, Probe 3 / PC6 turning OFF means the tank
+      dropped below the minimum safe level at least once.
+    - This does NOT stop the drain immediately.
+    - The Auto Drain valve remains ON until the full 10-minute drain time
+      is completed.
+    - After 10 minutes:
+        probe3OffDetected == true  -> drain success, go OFF
+        probe3OffDetected == false -> E10 drain failure
+*/
+static bool autoDrainProbe3OffDetected = false;
+
+// ======================================================
+// FEATURE SETTINGS - FAN / SCENT / LIGHT / DRAIN
+// ======================================================
+
+// ======================================================
+// SCENT PUMP / DIP6 SETTINGS
+// ======================================================
+
+// Scent pump fixed ON time from the documentation.
+#define SCENT_PUMP_ON_TIME_MS 2000UL
+
+// Scent pump is allowed only when NTC2 water tank temperature is >= 95°C.
+#define SCENT_PUMP_MIN_TEMP_C 95
+
+// Scent pump set-point range:
+// 0 = OFF
+// 1 to 19 = interval operation
+// 20 = continuously ON
+#define SCENT_PUMP_SETPOINT_OFF 0
+#define SCENT_PUMP_SETPOINT_CONTINUOUS 20
+
+// ======================================================
+// CABIN LIGHT / DIP8 DIMMER SETTINGS
+// ======================================================
+
+/*
+  Reference dimmer method from the original controller:
+    - called every 75 us
+    - FNET is read by polling
+    - output is turned OFF at each FNET transition
+    - output turns ON after the phase threshold
+    - output turns OFF near the next zero-cross
+*/
+#define CABIN_LIGHT_PHASE_TICK_US 75UL
+
+/*
+  50 Hz:
+    20000 us full cycle / 2 / 75 us = 133 ticks
+
+  60 Hz:
+    16600 us full cycle / 2 / 75 us = 110 ticks
+*/
+#define CABIN_LIGHT_MAXFASE_50HZ (20000UL / (2UL * CABIN_LIGHT_PHASE_TICK_US))
+#define CABIN_LIGHT_MAXFASE_60HZ (16600UL / (2UL * CABIN_LIGHT_PHASE_TICK_US))
+
+/*
+  Original minimum brightness.
+  Below 15%, the light is treated as OFF.
+*/
+#define CABIN_LIGHT_MINSTAND_50HZ 15
+#define CABIN_LIGHT_MINSTAND_60HZ 15
+
+/*
+  Turn the triac/opto drive OFF slightly before the zero-cross region.
+*/
+#define CABIN_LIGHT_ZERO_CROSS_OFF_MARGIN_TICKS 20
+
+/*
+  Minimum 15 ms between same-polarity FNET transitions.
+*/
+#define CABIN_LIGHT_FNET_LOCKOUT_TICKS ((uint8_t)(15000UL / CABIN_LIGHT_PHASE_TICK_US))
+
+/*
+  One-second window used for 50/60 Hz detection.
+*/
+#define CABIN_LIGHT_PHASE_TICKS_PER_SECOND (1000000UL / CABIN_LIGHT_PHASE_TICK_US)
+
+/*
+  If no FNET transition is detected for 100 ms, force the dimmer output OFF.
+*/
+#define CABIN_LIGHT_PHASE_FNET_TIMEOUT_TICKS (100000UL / CABIN_LIGHT_PHASE_TICK_US)
+
+// ======================================================
+// PROBE DEBOUNCE VARIABLES
+// ======================================================
+
+struct StableProbeInput {
+  /*
+    Stable confirmed state used by fill/drain/contactor/error logic.
+  */
+  bool stableState;
+
+  /*
+    Candidate raw state currently being confirmed.
+  */
+  bool candidateState;
+
+  /*
+    Last raw pin state sampled from the input.
+  */
+  bool lastRawState;
+
+  /*
+    Time when candidateState started.
+  */
+  unsigned long candidateStartTime;
+
+  /*
+    Time when stableState last changed.
+    Useful for testing/debugging and future diagnostics.
+  */
+  unsigned long stableChangeTime;
+};
+
+StableProbeInput probe1State = { false, false, false, 0, 0 };
+StableProbeInput probe2State = { false, false, false, 0, 0 };
+StableProbeInput probe3State = { false, false, false, 0, 0 };
+
+// ======================================================
+// CABIN LIGHT / DIP8 DIMMER STATE VARIABLES
+// ======================================================
+
+// U6 DIP8:
+// false = basic ON/OFF mode
+// true  = dimmer mode
+static volatile bool cabinLightDimmerEnabledByDip = false;
+
+// Current requested light level.
+// 0 = OFF
+// 15..100 = phase-controlled brightness in dimmer mode
+static volatile uint8_t cabinLightLevelPercent = 0;
+
+// True when UI requested light ON.
+static volatile bool cabinLightRequestedOn = false;
+
+// Actual PC1 output state.
+static volatile bool cabinLightOutputState = false;
+
+// Legacy force flag retained for compatibility; new error-light behavior uses
+// one-time auto ON so the user can still toggle the light OFF during error.
+static volatile bool cabinLightForcedByError = false;
+static volatile bool cabinLightErrorAutoApplied = false;
+
+/*
+  Reference-style phase-control variables.
+*/
+static volatile bool cabinLightDetected60Hz = false;
+
+/*
+  Converted low-level phase threshold.
+  0 = OFF.
+*/
+static volatile uint8_t cabinLightPhaseLevelLL = 0;
+
+/*
+  Same concept as bFaseTmr in the old reference code.
+*/
+static volatile uint8_t cabinLightPhaseTimer = 0;
+
+/*
+  Filtered FNET state.
+*/
+static volatile bool cabinLightFnetState = false;
+
+/*
+  Previous AC half-cycle state.
+*/
+static volatile bool cabinLightPreviousPeriod = false;
+
+/*
+  One firing per half-cycle.
+*/
+static volatile bool cabinLightAlreadyFired = false;
+
+/*
+  Compensation for unequal FNET positive/negative timing.
+*/
+static volatile uint8_t cabinLightPhaseCounterPos = 0;
+static volatile uint8_t cabinLightPhaseCounterNeg = 0;
+
+/*
+  Wait for zero-cross when jumping from OFF to 100%.
+*/
+static volatile bool cabinLightHoldForZeroCrossing = false;
+
+
+
+
+// ======================================================
+// FORWARD DECLARATIONS - required before Demand Switch functions
+// ======================================================
+
+void readWaterProbes(bool *probe1On, bool *probe2On, bool *probe3On);
+double readNtc1TemperatureC();
+void setContactor(bool on);
+void forceNormalContactorOff();
+void setOperationMode(OperationMode newMode);
+void sendPowerOnAckToUI(bool accepted);
+void sendHeartbeatAckToUI();
+void allOutputsOff();
+bool startupFaultValidationReady();
+void validateAndClearFixedFaultWhileOff();
+FaultCode detectRawFault();
+void sendErrorToUI();
+void startOffStateSlaveRecoveryScan();
+bool generatorChainReadyForOperation();
+
+// ======================================================
+// DEMAND SWITCH / ILLUMINATION FUNCTIONS
+// ======================================================
+
+bool readDemandSwitchRawPressed() {
+  bool pinHigh = ((DEMAND_SW_PINREG & (1 << DEMAND_SW_PIN)) != 0);
+
+#if DEMAND_SW_ACTIVE_LOW
+  return !pinHigh;
+#else
+  return pinHigh;
+#endif
+}
+
+void updateDemandSwitchButton() {
+  /*
+    Piezo switch is momentary NO. Use a short debounce so the generated pulse
+    is not missed, but still reject noise from the 12 V input network.
+  */
+
+  bool rawPressed = readDemandSwitchRawPressed();
+  unsigned long now = millis();
+
+  demandSwitchPressEvent = false;
+
+  if (rawPressed != demandSwitchLastRawPressed) {
+    demandSwitchLastRawPressed = rawPressed;
+    demandSwitchLastChangeTime = now;
+  }
+
+  if ((now - demandSwitchLastChangeTime) >= DEMAND_SW_DEBOUNCE_MS) {
+    if (rawPressed != demandSwitchStablePressed) {
+      demandSwitchStablePressed = rawPressed;
+
+      if (demandSwitchStablePressed) {
+        demandSwitchPressEvent = true;
+      }
+    }
+  }
+}
+
+void setDemandIlluminationOutputRaw(bool on) {
+  demandIlluminationOutputState = on;
+
+#if DEMAND_ILLUMINATION_ACTIVE_HIGH
+  if (on) {
+    DEMAND_ILLUMINATION_PORT |= (1 << DEMAND_ILLUMINATION_PIN);
+  } else {
+    DEMAND_ILLUMINATION_PORT &= ~(1 << DEMAND_ILLUMINATION_PIN);
+  }
+#else
+  if (on) {
+    DEMAND_ILLUMINATION_PORT &= ~(1 << DEMAND_ILLUMINATION_PIN);
+  } else {
+    DEMAND_ILLUMINATION_PORT |= (1 << DEMAND_ILLUMINATION_PIN);
+  }
+#endif
+}
+
+void setDemandIlluminationMode(DemandIlluminationMode mode) {
+  demandIlluminationMode = mode;
+  lastDemandIlluminationToggleTime = millis();
+
+  if (mode == DEMAND_ILLUMINATION_OFF) {
+    setDemandIlluminationOutputRaw(false);
+  } else if (mode == DEMAND_ILLUMINATION_ON) {
+    setDemandIlluminationOutputRaw(true);
+  }
+}
+
+void startDemandIlluminationStartupSequence() {
+  /*
+    Called at boot and when the UI requests the Power Controller version.
+
+    Required behavior:
+      - PC version display + UI version display: illumination steady ON
+      - Then OFF for 0.5 second
+      - Then normal state-based illumination takes over
+  */
+
+  demandIlluminationStartupSequenceActive = true;
+  demandIlluminationStartupSequenceStartTime = millis();
+  demandIlluminationFastOverrideUntilTime = 0;
+  lastDemandIlluminationToggleTime = millis();
+  setDemandIlluminationOutputRaw(true);
+}
+
+DemandIlluminationMode getStateBasedDemandIlluminationMode() {
+  unsigned long now = millis();
+
+  if (demandIlluminationStartupSequenceActive) {
+    unsigned long elapsed = now - demandIlluminationStartupSequenceStartTime;
+
+    if (elapsed < DEMAND_ILLUMINATION_STARTUP_ON_MS) {
+      return DEMAND_ILLUMINATION_ON;
+    }
+
+    if (elapsed < (DEMAND_ILLUMINATION_STARTUP_ON_MS + DEMAND_ILLUMINATION_AFTER_STARTUP_OFF_MS)) {
+      return DEMAND_ILLUMINATION_OFF;
+    }
+
+    demandIlluminationStartupSequenceActive = false;
+    lastDemandIlluminationToggleTime = now;
+    setDemandIlluminationOutputRaw(false);
+  }
+
+  /*
+    Drain State has highest priority.
+    Demand Switch input and fast-blink feedback are ignored during drain.
+  */
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    return DEMAND_ILLUMINATION_OFF;
+  }
+
+  if (operationEnabled && operationMode == MODE_SESSION) {
+    return DEMAND_ILLUMINATION_ON;
+  }
+
+  if (operationEnabled && operationMode == MODE_STANDBY) {
+    return DEMAND_ILLUMINATION_SLOW;
+  }
+
+  /*
+    OFF state: slow blink, 1 second OFF / 1 second ON.
+    No separate Error illumination pattern has been specified yet, so a latched
+    error that has forced operationEnabled=false also falls back to this base
+    OFF-state indication unless Drain is active.
+  */
+  return DEMAND_ILLUMINATION_SLOW;
+}
+
+DemandIlluminationMode getActiveDemandIlluminationMode() {
+  unsigned long now = millis();
+
+  /*
+    Drain State must stay OFF.
+    Even an existing fast-blink override is suppressed during drain.
+  */
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    demandIlluminationFastOverrideUntilTime = 0;
+    return DEMAND_ILLUMINATION_OFF;
+  }
+
+  if ((long)(now - demandIlluminationFastOverrideUntilTime) < 0) {
+    return DEMAND_ILLUMINATION_FAST;
+  }
+
+  return getStateBasedDemandIlluminationMode();
+}
+
+void startDemandIlluminationFastOverride() {
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  demandIlluminationFastOverrideUntilTime = now + DEMAND_ILLUMINATION_PRESS_OVERRIDE_MS;
+  lastDemandIlluminationToggleTime = now;
+  setDemandIlluminationOutputRaw(true);
+}
+
+void updateDemandIllumination() {
+  DemandIlluminationMode activeMode = getActiveDemandIlluminationMode();
+  unsigned long now = millis();
+
+  if (activeMode == DEMAND_ILLUMINATION_OFF) {
+    setDemandIlluminationOutputRaw(false);
+    return;
+  }
+
+  if (activeMode == DEMAND_ILLUMINATION_ON) {
+    setDemandIlluminationOutputRaw(true);
+    return;
+  }
+
+  unsigned long onTimeMs;
+  unsigned long offTimeMs;
+
+  if (activeMode == DEMAND_ILLUMINATION_FAST) {
+    onTimeMs = DEMAND_ILLUMINATION_FAST_ON_MS;
+    offTimeMs = DEMAND_ILLUMINATION_FAST_OFF_MS;
+  } else {
+    onTimeMs = DEMAND_ILLUMINATION_SLOW_ON_MS;
+    offTimeMs = DEMAND_ILLUMINATION_SLOW_OFF_MS;
+  }
+
+  unsigned long requiredTime = demandIlluminationOutputState ? onTimeMs : offTimeMs;
+
+  if ((now - lastDemandIlluminationToggleTime) >= requiredTime) {
+    lastDemandIlluminationToggleTime = now;
+    setDemandIlluminationOutputRaw(!demandIlluminationOutputState);
+  }
+}
+
+bool demandHeatBoostSafetyAllowed() {
+  if (!operationEnabled) {
+    return false;
+  }
+
+  if (operationMode != MODE_SESSION) {
+    return false;
+  }
+
+  if (communicationFault || pendingFault != FAULT_NONE || activeFault != FAULT_NONE) {
+    return false;
+  }
+
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    return false;
+  }
+
+  bool probe1On = false;
+  bool probe2On = false;
+  bool probe3On = false;
+  readWaterProbes(&probe1On, &probe2On, &probe3On);
+
+  (void)probe1On;
+  (void)probe2On;
+
+  return probe3On;
+}
+
+bool demandHeatBoostStartConditionAllowed() {
+  if (!demandHeatBoostSafetyAllowed()) {
+    return false;
+  }
+
+  /*
+    User requirement:
+      In Session mode, if actual cabin temperature is greater than the
+      target temperature, Demand Switch press forces the contactor ON for
+      30 seconds.
+
+    Do not require the contactor to already be OFF here. In normal operation
+    it should already be OFF because the actual temperature is above target,
+    but allowing the boost to latch even if the output has not yet switched
+    OFF makes the behavior deterministic.
+  */
+  double cabinTempC = readNtc1TemperatureC();
+
+  if (cabinTempC <= sessionSetPointC) {
+    return false;
+  }
+
+  return true;
+}
+
+void startDemandHeatBoost() {
+  if (!demandHeatBoostStartConditionAllowed()) {
+    return;
+  }
+
+  demandHeatBoostActive = true;
+  demandHeatBoostStartTime = millis();
+
+  normalContactorState = true;
+  setContactor(true);
+}
+
+void cancelDemandHeatBoost() {
+  demandHeatBoostActive = false;
+}
+
+bool updateDemandHeatBoostController(bool waterLevelSafeForContactor) {
+  /*
+    Returns true while Demand Boost owns the contactor output.
+    Normal temperature control must not overwrite the contactor during this time.
+  */
+
+  if (!demandHeatBoostActive) {
+    return false;
+  }
+
+  if (!demandHeatBoostSafetyAllowed() || !waterLevelSafeForContactor) {
+    cancelDemandHeatBoost();
+    forceNormalContactorOff();
+    return false;
+  }
+
+  unsigned long now = millis();
+
+  if ((now - demandHeatBoostStartTime) >= DEMAND_HEAT_BOOST_MS) {
+    cancelDemandHeatBoost();
+
+    normalContactorState = false;
+    lastNormalContactorActionTime = now;
+    setContactor(false);
+    return false;
+  }
+
+  normalContactorState = true;
+  setContactor(true);
+  return true;
+}
+
+void demandSwitchRequestPowerOn() {
+  /*
+    Demand Switch OFF -> ON request.
+
+    Before accepting ON, validate any stored OFF-state fault and make sure
+    startup physical-input validation is complete.
+  */
+  validateAndClearFixedFaultWhileOff();
+
+  uiRequestedOnState = true;
+
+  if (!startupFaultValidationReady()) {
+    operationEnabled = false;
+    allOutputsOff();
+    sendPowerOnAckToUI(false);
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  if (!generatorChainReadyForOperation()) {
+    operationEnabled = false;
+    allOutputsOff();
+    sendPowerOnAckToUI(false);
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  FaultCode rawFaultBeforeOn = detectRawFault();
+
+  if (rawFaultBeforeOn != FAULT_NONE) {
+    activeFault = rawFaultBeforeOn;
+    pendingFault = FAULT_NONE;
+    pendingFaultStartTime = 0;
+
+    operationEnabled = false;
+    allOutputsOff();
+
+    sendPowerOnAckToUI(false);
+    sendErrorToUI();
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  if (activeFault == FAULT_NONE && pendingFault == FAULT_NONE && !communicationFault) {
+    operationEnabled = true;
+    setOperationMode(MODE_SESSION);
+
+    waterBelowProbe3TimerRunning = false;
+    fillToProbe2TimerRunning = false;
+
+    sendPowerOnAckToUI(true);
+    sendHeartbeatAckToUI();
+  } else {
+    operationEnabled = false;
+    allOutputsOff();
+    sendPowerOnAckToUI(false);
+    sendHeartbeatAckToUI();
+  }
+}
+
+void updateDemandSwitchLogic() {
+  if (!demandSwitchPressEvent) {
+    return;
+  }
+
+  demandSwitchPressEvent = false;
+
+  /*
+    Drain State:
+      Demand Switch has no command and no fast-blink feedback.
+      Illumination remains OFF through getActiveDemandIlluminationMode().
+  */
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    demandIlluminationFastOverrideUntilTime = 0;
+    return;
+  }
+
+  startDemandIlluminationFastOverride();
+
+  /*
+    Demand Switch must not reset or bypass any active/pending fault.
+    Manual error reset remains UI S6 long press / Power OFF command only.
+  */
+  if (communicationFault || pendingFault != FAULT_NONE || activeFault != FAULT_NONE) {
+    return;
+  }
+
+  if (!operationEnabled) {
+    demandSwitchRequestPowerOn();
+    return;
+  }
+
+  if (operationMode == MODE_SESSION) {
+    /*
+      Final Session Time behavior:
+        - If actual temperature > target temperature, Demand Switch starts
+          the 30-second contactor boost.
+        - If actual temperature <= target temperature, Demand Switch does
+          nothing. It must NOT change Session -> Standby.
+    */
+    if (demandHeatBoostStartConditionAllowed()) {
+      startDemandHeatBoost();
+      sendHeartbeatAckToUI();
+      return;
+    }
+
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  if (operationMode == MODE_STANDBY) {
+    /*
+      Standby Time state:
+        Demand Switch behaves like S6 short press and changes Standby ->
+        Session. It does not start Demand Boost while in Standby.
+    */
+    setOperationMode(MODE_SESSION);
+    sendHeartbeatAckToUI();
+    return;
+  }
+}
+
+// ======================================================
+// BASIC OUTPUT, FAN, SCENT, AND SYSTEM OFF FUNCTIONS
+// ======================================================
+
+/*
+  Function grouping note:
+    - setFan() controls Fan / DIP7 output permission.
+    - setScentPumpOutput() is the direct Scent Pump / DIP6 output helper.
+    - Cabin Light / DIP8 dimmer functions are grouped in the dedicated
+      cabin light section below.
+*/
+
+
+void setOutput(volatile uint8_t *port, uint8_t bit, bool on) {
+#if OUTPUT_ACTIVE_HIGH
+  if (on) {
+    *port |= (1 << bit);
+  } else {
+    *port &= ~(1 << bit);
+  }
+#else
+  if (on) {
+    *port &= ~(1 << bit);
+  } else {
+    *port |= (1 << bit);
+  }
+#endif
+}
+
+void setLed(bool on) {
+#if LED_ACTIVE_HIGH
+  if (on) {
+    LED_PORT |= (1 << LED_PIN);
+  } else {
+    LED_PORT &= ~(1 << LED_PIN);
+  }
+#else
+  if (on) {
+    LED_PORT &= ~(1 << LED_PIN);
+  } else {
+    LED_PORT |= (1 << LED_PIN);
+  }
+#endif
+}
+
+void updateAliveLed() {
+  /*
+    PB7 / SCK LED behavior:
+      - Normal/no error: existing alive blink speed.
+      - Any pending/active error or communication fault: fast blink.
+
+    This is only an indicator. It does not affect outputs, errors,
+    communication, relay control, drain, fill, or temperature logic.
+  */
+  bool errorLedMode =
+    communicationFault ||
+    (pendingFault != FAULT_NONE) ||
+    (activeFault != FAULT_NONE);
+
+  unsigned long blinkInterval = errorLedMode ? ERROR_LED_INTERVAL_MS : ALIVE_LED_INTERVAL_MS;
+
+  if ((millis() - lastAliveLedToggleTime) >= blinkInterval) {
+    lastAliveLedToggleTime = millis();
+    aliveLedState = !aliveLedState;
+    setLed(aliveLedState);
+  }
+}
+
+void setContactor(bool on) {
+  setOutput(&CONTACTOR_PORT, CONTACTOR_PIN, on);
+}
+
+void setAutoFill(bool on) {
+  setOutput(&AUTOFILL_PORT, AUTOFILL_PIN, on);
+}
+
+void setAutoDrain(bool on) {
+  /*
+    AUTODRAIN circuit is ACTIVE-HIGH.
+
+    From the schematic:
+      MCU AUTODRAIN pin -> R10 220R -> TLP3052 LED -> GND
+
+    Therefore:
+      HIGH = optocoupler LED ON  = Auto Drain ON
+      LOW  = optocoupler LED OFF = Auto Drain OFF
+
+    Important:
+      Do not check DIP5 inside this low-level output function.
+      DIP5 is checked only when the drain sequence starts.
+      Once draining has started, this output must stay latched ON until
+      Probe 3 is OFF or an error/system stop occurs.
+  */
+
+  if (on) {
+    AUTODRAIN_PORT |= (1 << AUTODRAIN_PIN);
+  } else {
+    AUTODRAIN_PORT &= ~(1 << AUTODRAIN_PIN);
+  }
+}
+
+// Direct output helper for Scent Pump / DIP6.
+void setScentPumpOutput(bool on) {
+  /*
+    This directly controls the Scent Pump output pin.
+    The logic/permission checks are handled in updateScentPumpController().
+  */
+
+  scentPumpOutputState = on;
+  setOutput(&SCENT_PUMP_PORT, SCENT_PUMP_PIN, on);
+}
+
+// Direct output helper for Fan / DIP7.
+void setFan(bool on) {
+  /*
+    U6 DIP7 controls whether the Fan feature is available.
+
+    DIP7 OFF:
+      Fan output is always OFF.
+
+    DIP7 ON:
+      Fan can be controlled by the User Interface.
+  */
+
+  if (!fanEnabledByDip) {
+    fanRequested = false;
+    setOutput(&FAN_PORT, FAN_PIN, false);
+    return;
+  }
+
+  /*
+    Fan is not allowed when the system is OFF
+    or when an error is pending/active.
+  */
+  if (!operationEnabled || pendingFault != FAULT_NONE || activeFault != FAULT_NONE) {
+    fanRequested = false;
+    setOutput(&FAN_PORT, FAN_PIN, false);
+    return;
+  }
+
+  fanRequested = on;
+  setOutput(&FAN_PORT, FAN_PIN, on);
+}
+
+bool getOutputState(volatile uint8_t *port, uint8_t bit) {
+  bool pinHigh = ((*port & (1 << bit)) != 0);
+
+#if OUTPUT_ACTIVE_HIGH
+  return pinHigh;
+#else
+  return !pinHigh;
+#endif
+}
+
+
+// ======================================================
+// ADC AND NTC TEMPERATURE FUNCTIONS
+// ======================================================
+
+void setupADC() {
+  /*
+    AVCC reference.
+    ADC enabled.
+    Prescaler 128.
+
+    Required build target:
+      ATmega32 / 16 MHz external crystal
+
+    At 16 MHz:
+      ADC clock = 125 kHz
+
+    This keeps NTC1/NTC2 conversion stable after changing
+    from the older 8 MHz ATmega16 setup to the 16 MHz ATmega32 setup.
+  */
+  ADMUX = (1 << REFS0);
+  ADCSRA = (1 << ADEN) | (1 << ADPS2) | (1 << ADPS1) | (1 << ADPS0);
+}
+
+uint16_t readADC(uint8_t channel) {
+  channel &= 0x07;
+
+  ADMUX = (1 << REFS0) | channel;
+  delayMicroseconds(20);
+
+  ADCSRA |= (1 << ADSC);
+
+  while (ADCSRA & (1 << ADSC)) {
+    // Wait until ADC conversion is done.
+  }
+
+  return ADC;
+}
+
+struct NtcAdcAverageFilter {
+  uint32_t total;
+  uint16_t count;
+  uint16_t average;
+  bool ready;
+};
+
+NtcAdcAverageFilter ntc1AdcFilter = {0, 0, 0, false};
+NtcAdcAverageFilter ntc2AdcFilter = {0, 0, 0, false};
+
+/*
+  NOTE:
+    Do not use NtcAdcAverageFilter as a function parameter in an Arduino .ino file.
+    The Arduino preprocessor may generate function prototypes before this struct is declared,
+    causing compile errors like:
+      "NtcAdcAverageFilter was not declared in this scope"
+
+    These helper functions directly update the global NTC filters instead.
+*/
+
+void resetNtcAdcAverageFilters() {
+  uint16_t ntc1InitialReading = readADC(ADC_NTC1_CHANNEL);
+  uint16_t ntc2InitialReading = readADC(ADC_NTC2_CHANNEL);
+
+  ntc1AdcFilter.total = 0;
+  ntc1AdcFilter.count = 0;
+  ntc1AdcFilter.average = ntc1InitialReading;
+  ntc1AdcFilter.ready = false;
+
+  ntc2AdcFilter.total = 0;
+  ntc2AdcFilter.count = 0;
+  ntc2AdcFilter.average = ntc2InitialReading;
+  ntc2AdcFilter.ready = false;
+}
+
+void updateNtc1AdcAverageFilter() {
+  ntc1AdcFilter.total += readADC(ADC_NTC1_CHANNEL);
+  ntc1AdcFilter.count++;
+
+  if (ntc1AdcFilter.count >= NTC_AVERAGE_SAMPLE_COUNT) {
+    ntc1AdcFilter.average = (uint16_t)(ntc1AdcFilter.total / ntc1AdcFilter.count);
+    ntc1AdcFilter.total = 0;
+    ntc1AdcFilter.count = 0;
+    ntc1AdcFilter.ready = true;
+  }
+}
+
+void updateNtc2AdcAverageFilter() {
+  ntc2AdcFilter.total += readADC(ADC_NTC2_CHANNEL);
+  ntc2AdcFilter.count++;
+
+  if (ntc2AdcFilter.count >= NTC_AVERAGE_SAMPLE_COUNT) {
+    ntc2AdcFilter.average = (uint16_t)(ntc2AdcFilter.total / ntc2AdcFilter.count);
+    ntc2AdcFilter.total = 0;
+    ntc2AdcFilter.count = 0;
+    ntc2AdcFilter.ready = true;
+  }
+}
+
+void updateNtcAdcAverageFilters() {
+  /*
+    Non-blocking averaging.
+    One NTC1 sample and one NTC2 sample are added per loop.
+    After 300 samples, E1/E2/E3/E4 uses the average value.
+  */
+  updateNtc1AdcAverageFilter();
+  updateNtc2AdcAverageFilter();
+}
+
+bool ntcAdcAveragesReady() {
+  return ntc1AdcFilter.ready && ntc2AdcFilter.ready;
+}
+
+uint16_t getNtc1AdcAverageOrLast() {
+  return ntc1AdcFilter.average;
+}
+
+uint16_t getNtc2AdcAverageOrLast() {
+  return ntc2AdcFilter.average;
+}
+
+double thermistorToCelsius(uint16_t rawAdc) {
+  /*
+    Based on your existing Thermister() function.
+
+    Circuit assumption:
+      - 10k NTC
+      - 10k reference resistor
+      - 5 V ADC reference
+      - Same voltage divider direction as previous project
+
+    Do not calculate temperature if ADC is already in open/short range.
+  */
+
+  if (rawAdc <= NTC_SHORT_THRESHOLD) {
+    return -100.0;  // Invalid: short circuit
+  }
+
+  if (rawAdc >= NTC_OPEN_THRESHOLD) {
+    return 200.0;  // Invalid: open circuit
+  }
+
+  double voltage = rawAdc * (5.0 / 1023.0);
+
+  double resistance = 10000.0 * voltage / (5.0 - voltage);
+
+  double logR = log(resistance);
+
+  double tempK =
+    1.0 / (0.001138177396 + 0.0002326061337 * logR + 0.0000000961782205 * logR * logR * logR);
+
+  double tempC = tempK - 273.0;
+
+  return tempC;
+}
+
+double calibrateTemperature(double tempC) {
+  /*
+    From your old reference code:
+      tcalc = (0.9 * temperature) + 2.5
+  */
+  return (0.9 * tempC) + 2.5;
+}
+
+double readNtcTemperatureC(uint8_t adcChannel) {
+  uint16_t rawAdc;
+
+  if (adcChannel == ADC_NTC1_CHANNEL) {
+    rawAdc = getNtc1AdcAverageOrLast();
+  } else if (adcChannel == ADC_NTC2_CHANNEL) {
+    rawAdc = getNtc2AdcAverageOrLast();
+  } else {
+    rawAdc = readADC(adcChannel);
+  }
+
+  double tempC = thermistorToCelsius(rawAdc);
+  return calibrateTemperature(tempC);
+}
+
+int16_t getE12TriggerTempC() {
+  /*
+    E12 trigger temperature depends on U6 DIP4.
+    This threshold is for NTC1/cabin temperature only.
+
+    DIP4 OFF:
+      maxTempC = 50°C
+      E12 = 50 + 10 = 60°C
+
+    DIP4 ON:
+      maxTempC = 55°C
+      E12 = 55 + 10 = 65°C
+  */
+
+  return maxTempC + E12_OVER_TEMP_MARGIN_C;
+}
+
+
+// Forward declarations used by session/standby timer helpers.
+void enterOffMode();
+void sendHeartbeatAckToUI();
+void sendHeartbeatToUI();
+void updateBidirectionalHeartbeat();
+void startAutoDrainPreparation();
+void updateDemandSwitchButton();
+void updateDemandSwitchLogic();
+void updateDemandIllumination();
+void setDemandIlluminationMode(DemandIlluminationMode mode);
+void startDemandIlluminationStartupSequence();
+void cancelDemandHeatBoost();
+void setContactor(bool on);
+void forceNormalContactorOff();
+void allOutputsOff();
+bool getOutputState(volatile uint8_t *port, uint8_t bit);
+void readWaterProbes(bool *probe1On, bool *probe2On, bool *probe3On);
+double readNtc1TemperatureC();
+void setOperationMode(OperationMode newMode);
+void sendPowerOnAckToUI(bool accepted);
+
+// Forward declarations used by cabin light reference-style dimmer.
+void setCabinLightOutputRaw(bool on);
+void convertCabinLightPhaseControl();
+bool readCabinLightFnetFiltered();
+void cabinLightPhaseControlTick();
+void setupCabinLightPhaseControlTimer2();
+
+// ======================================================
+// TEMPERATURE CONTROL FUNCTIONS
+// ======================================================
+
+void setSessionSetPointC(int16_t newSetPointC) {
+  /*
+    Session target temperature comes from the User Interface later.
+
+    U6 DIP4 controls the maximum allowed target:
+      DIP4 OFF = max 50°C
+      DIP4 ON  = max 55°C
+  */
+
+  if (newSetPointC < MIN_TARGET_TEMP_C) {
+    newSetPointC = MIN_TARGET_TEMP_C;
+  }
+
+  // Clamp the target temperature based on U6 DIP4.
+  if (newSetPointC > maxTempC) {
+    newSetPointC = maxTempC;
+  }
+
+  sessionSetPointC = newSetPointC;
+}
+
+void updateMaxTemperatureFromDip() {
+  /*
+    U6 DIP4 selects the maximum allowed session target temperature.
+      DIP4 OFF = 50°C
+      DIP4 ON  = 55°C
+
+    If the DIP setting changes while the saved target is above the new limit,
+    clamp the target immediately so the UI/PC cannot command an invalid value.
+  */
+
+  if (temperatureRangeHighByDip) {
+    maxTempC = MAX_TEMP_HIGH_RANGE_C;
+  } else {
+    maxTempC = MAX_TEMP_LOW_RANGE_C;
+  }
+
+  if (sessionSetPointC > maxTempC) {
+    sessionSetPointC = maxTempC;
+  }
+
+  if (sessionSetPointC < MIN_TARGET_TEMP_C) {
+    sessionSetPointC = MIN_TARGET_TEMP_C;
+  }
+}
+
+uint32_t minutesToCountdownSeconds(uint16_t minutes) {
+  /*
+    Converts minutes to real countdown seconds.
+    TIME_UNLIMITED is represented internally as 0xFFFFFFFF.
+  */
+
+  if (minutes == TIME_UNLIMITED) {
+    return 0xFFFFFFFFUL;
+  }
+
+  return (uint32_t)minutes * 60UL;
+}
+
+uint16_t secondsToMinutesCeil(uint32_t seconds) {
+  /*
+    Converts remaining seconds to display/storage minutes.
+    This is rounded up so 59 seconds still reports as 1 minute.
+  */
+
+  if (seconds == 0xFFFFFFFFUL) {
+    return TIME_UNLIMITED;
+  }
+
+  return (uint16_t)((seconds + 59UL) / 60UL);
+}
+
+void decrementCountdownSeconds(uint32_t *remainingSeconds,
+                               unsigned long *lastTickTime,
+                               unsigned long now) {
+  /*
+    Decrements countdown in real seconds.
+    This avoids losing time if loop timing is delayed.
+  */
+
+  if (*remainingSeconds == 0 || *remainingSeconds == 0xFFFFFFFFUL) {
+    return;
+  }
+
+  if ((now - *lastTickTime) < SESSION_STANDBY_COUNTDOWN_TICK_MS) {
+    return;
+  }
+
+  unsigned long elapsedTicks = (now - *lastTickTime) / SESSION_STANDBY_COUNTDOWN_TICK_MS;
+  *lastTickTime += elapsedTicks * SESSION_STANDBY_COUNTDOWN_TICK_MS;
+
+  if (*remainingSeconds > elapsedTicks) {
+    *remainingSeconds -= elapsedTicks;
+  } else {
+    *remainingSeconds = 0;
+  }
+}
+
+void enterSessionMode() {
+  cancelDemandHeatBoost();
+
+  /*
+    Session mode entry:
+      - load SessionTime from StartSessionTime
+      - use NTC1 / cabin temperature control
+      - countdown runs in seconds
+  */
+
+  operationMode = MODE_SESSION;
+  sessionRemainingSeconds = minutesToCountdownSeconds(startSessionTimeMin);
+  sessionTimeMin = secondsToMinutesCeil(sessionRemainingSeconds);
+  lastSessionCountdownTickTime = millis();
+}
+
+void enterStandbyMode() {
+  cancelDemandHeatBoost();
+
+  /*
+    Standby mode entry:
+      - load StandbyTime from StartStandbyTime
+      - use NTC2 / tank temperature control
+      - if Standby is disabled, go OFF instead
+  */
+
+  if (standbyDisabledByDip || startStandbyTimeMin == 0) {
+    enterOffMode();
+    return;
+  }
+
+  operationMode = MODE_STANDBY;
+  standbyTimeoutDrainStarted = false;
+  standbyRemainingSeconds = minutesToCountdownSeconds(startStandbyTimeMin);
+  standbyTimeMin = secondsToMinutesCeil(standbyRemainingSeconds);
+  lastStandbyCountdownTickTime = millis();
+}
+
+void setOperationMode(OperationMode newMode) {
+  if (newMode == MODE_SESSION) {
+    enterSessionMode();
+    return;
+  }
+
+  if (newMode == MODE_STANDBY) {
+    enterStandbyMode();
+    return;
+  }
+
+  // Unknown mode: fail safe to Session timing, but do not enable outputs here.
+  enterSessionMode();
+}
+
+void updateSessionAndStandbyCountdown() {
+  /*
+    Session behavior:
+      Session countdown is in seconds.
+      When remaining seconds reaches 0, automatically enter Standby mode.
+
+    Standby behavior:
+      Standby countdown is in seconds.
+      When remaining seconds reaches 0, start drain preparation ONCE.
+
+    TIME_UNLIMITED means no countdown.
+  */
+
+  if (!operationEnabled) {
+    return;
+  }
+
+  if (pendingFault != FAULT_NONE || activeFault != FAULT_NONE || communicationFault) {
+    return;
+  }
+
+  unsigned long now = millis();
+
+  if (operationMode == MODE_SESSION) {
+    if (startSessionTimeMin == TIME_UNLIMITED || sessionRemainingSeconds == 0xFFFFFFFFUL) {
+      sessionTimeMin = TIME_UNLIMITED;
+      return;
+    }
+
+    if (sessionRemainingSeconds == 0) {
+      enterStandbyMode();
+      sendHeartbeatAckToUI();
+      return;
+    }
+
+    decrementCountdownSeconds(&sessionRemainingSeconds, &lastSessionCountdownTickTime, now);
+    sessionTimeMin = secondsToMinutesCeil(sessionRemainingSeconds);
+
+    if (sessionRemainingSeconds == 0) {
+      enterStandbyMode();
+      sendHeartbeatAckToUI();
+      return;
+    }
+
+    return;
+  }
+
+  if (operationMode == MODE_STANDBY) {
+    if (standbyDisabledByDip || startStandbyTimeMin == 0) {
+      enterOffMode();
+      sendHeartbeatAckToUI();
+      return;
+    }
+
+    if (startStandbyTimeMin == TIME_UNLIMITED || standbyRemainingSeconds == 0xFFFFFFFFUL) {
+      standbyTimeMin = TIME_UNLIMITED;
+      return;
+    }
+
+    /*
+      Standby timeout drain trigger.
+
+      Important:
+        standbyRemainingSeconds stays 0 after timeout.
+        Without standbyTimeoutDrainStarted, this function will call
+        startAutoDrainPreparation() repeatedly every loop.
+    */
+    if (standbyRemainingSeconds == 0) {
+      if (!standbyTimeoutDrainStarted) {
+        standbyTimeoutDrainStarted = true;
+        startAutoDrainPreparation();
+        sendHeartbeatAckToUI();
+      }
+
+      return;
+    }
+
+    decrementCountdownSeconds(&standbyRemainingSeconds, &lastStandbyCountdownTickTime, now);
+    standbyTimeMin = secondsToMinutesCeil(standbyRemainingSeconds);
+
+    if (standbyRemainingSeconds == 0) {
+      if (!standbyTimeoutDrainStarted) {
+        standbyTimeoutDrainStarted = true;
+        startAutoDrainPreparation();
+        sendHeartbeatAckToUI();
+      }
+
+      return;
+    }
+  }
+}
+
+double readNtc1TemperatureC() {
+  return readNtcTemperatureC(ADC_NTC1_CHANNEL);
+}
+
+double readNtc2TemperatureC() {
+  return readNtcTemperatureC(ADC_NTC2_CHANNEL);
+}
+
+bool updateTemperatureHeatDemand() {
+  /*
+    SESSION MODE:
+      NTC1 controls cabin temperature.
+
+      If temperature > setpoint + 1°C:
+        heat demand OFF
+
+      If temperature < setpoint - 1°C:
+        heat demand ON
+
+      Between those values:
+        keep previous heat demand state.
+
+    STANDBY MODE:
+      NTC2 controls water tank temperature.
+
+      If tank temperature > 87°C:
+        heat demand OFF
+
+      If tank temperature < 83°C:
+        heat demand ON
+
+      Between 83°C and 87°C:
+        keep previous heat demand state.
+  */
+
+  if (operationMode == MODE_SESSION) {
+    if (generatorRole == GENERATOR_ROLE_SLAVE) {
+      temperatureHeatDemand = masterHeatPermissionFromChain;
+      return temperatureHeatDemand;
+    }
+
+    double cabinTempC = readNtc1TemperatureC();
+
+    if (cabinTempC > (sessionSetPointC + SESSION_TEMP_HYSTERESIS_C)) {
+      temperatureHeatDemand = false;
+    } else if (cabinTempC < (sessionSetPointC - SESSION_TEMP_HYSTERESIS_C)) {
+      temperatureHeatDemand = true;
+    }
+
+    return temperatureHeatDemand;
+  }
+
+  if (operationMode == MODE_STANDBY) {
+    double tankTempC = readNtc2TemperatureC();
+
+    if (tankTempC > STANDBY_TEMP_OFF_C) {
+      temperatureHeatDemand = false;
+    } else if (tankTempC < STANDBY_TEMP_ON_C) {
+      temperatureHeatDemand = true;
+    }
+
+    return temperatureHeatDemand;
+  }
+
+  // Unknown mode: fail safe.
+  temperatureHeatDemand = false;
+  return false;
+}
+
+void applyNormalContactorRequest(bool requestedOn) {
+  /*
+    This function applies the 30-second minimum switching interval.
+
+    Safety OFF is handled elsewhere using allOutputsOff().
+    This function is only for normal temperature-control switching.
+  */
+
+  unsigned long now = millis();
+
+  // No change needed.
+  if (requestedOn == normalContactorState) {
+    return;
+  }
+
+  // Enforce 30-second minimum between normal contactor actions.
+  if (lastNormalContactorActionTime != 0 && (now - lastNormalContactorActionTime) < CONTACTOR_MIN_ACTION_INTERVAL_MS) {
+    return;
+  }
+
+  normalContactorState = requestedOn;
+  lastNormalContactorActionTime = now;
+
+  setContactor(normalContactorState);
+}
+
+void forceNormalContactorOff() {
+  /*
+    Safety/error/OFF function.
+
+    This forces the contactor OFF immediately.
+    It also keeps the software state synchronized.
+  */
+
+  if (normalContactorState) {
+    normalContactorState = false;
+    lastNormalContactorActionTime = millis();
+  }
+
+  setContactor(false);
+}
+
+void allOutputsOff() {
+  cancelDemandHeatBoost();
+  forceNormalContactorOff();
+  setAutoFill(false);
+  setAutoDrain(false);
+  setScentPumpOutput(false);
+  setFan(false);
+}
+
+void enterOffMode() {
+  cancelDemandHeatBoost();
+
+  /*
+    Used when the system must go to OFF mode.
+
+    Important:
+      This function must NOT be called while drain is still active,
+      except when drain is finished, DIP5 is OFF, an error occurs,
+      or the user turns the system OFF.
+  */
+
+  operationEnabled = false;
+
+  standbyTimeoutDrainStarted = false;
+
+  autoDrainState = AUTODRAIN_IDLE;
+  autoDrainFillStarted = false;
+  autoDrainFillStartTime = 0;
+  autoDrainDrainStartTime = 0;
+  autoDrainProbe3OffDetected = false;
+
+  setAutoFill(false);
+  setAutoDrain(false);
+  setScentPumpOutput(false);
+  setFan(false);
+  forceNormalContactorOff();
+}
+
+
+// ======================================================
+// PROBE SENSOR FUNCTIONS
+// ======================================================
+
+bool readProbeRaw(volatile uint8_t *pinReg, uint8_t bit) {
+  bool pinIsHigh = ((*pinReg & (1 << bit)) != 0);
+
+#if SENSOR_ACTIVE_HIGH
+  return pinIsHigh;
+#else
+  return !pinIsHigh;
+#endif
+}
+
+bool updateStableProbe(StableProbeInput *input, bool rawState) {
+  /*
+    Reference-style probe filter for discrete tank probes.
+
+    The raw probe input is not trusted immediately. The new raw state must
+    remain unchanged for the confirmation time before it becomes stable.
+
+    This prevents relay chatter / water noise / steam condensation from
+    instantly changing fill, contactor, drain, or error logic.
+  */
+
+  unsigned long now = millis();
+
+  /*
+    Raw input changed compared with the last sampled raw state.
+    Start confirming this new raw state.
+  */
+  if (rawState != input->lastRawState) {
+    input->lastRawState = rawState;
+    input->candidateState = rawState;
+    input->candidateStartTime = now;
+  }
+
+  /*
+    If the candidate is already the stable state, nothing needs to change.
+  */
+  if (input->candidateState == input->stableState) {
+    return input->stableState;
+  }
+
+  unsigned long requiredTime = input->candidateState ? PROBE_ON_CONFIRM_MS : PROBE_OFF_CONFIRM_MS;
+
+  if ((now - input->candidateStartTime) >= requiredTime) {
+    input->stableState = input->candidateState;
+    input->stableChangeTime = now;
+  }
+
+  return input->stableState;
+}
+
+void readWaterProbes(bool *probe1On, bool *probe2On, bool *probe3On) {
+  bool probe1Raw = readProbeRaw(&PROBE1_PINREG, PROBE1_PIN);  // PA7
+  bool probe2Raw = readProbeRaw(&PROBE2_PINREG, PROBE2_PIN);  // PC7
+  bool probe3Raw = readProbeRaw(&PROBE3_PINREG, PROBE3_PIN);  // PC6
+
+  *probe1On = updateStableProbe(&probe1State, probe1Raw);
+  *probe2On = updateStableProbe(&probe2State, probe2Raw);
+  *probe3On = updateStableProbe(&probe3State, probe3Raw);
+}
+
+void resetProbeFilters() {
+  /*
+    Initialize stable probe states from the current raw readings.
+    This avoids waiting for the filter during the first loop after reset.
+  */
+
+  unsigned long now = millis();
+
+  bool probe1Raw = readProbeRaw(&PROBE1_PINREG, PROBE1_PIN);
+  bool probe2Raw = readProbeRaw(&PROBE2_PINREG, PROBE2_PIN);
+  bool probe3Raw = readProbeRaw(&PROBE3_PINREG, PROBE3_PIN);
+
+  probe1State.stableState = probe1Raw;
+  probe1State.candidateState = probe1Raw;
+  probe1State.lastRawState = probe1Raw;
+  probe1State.candidateStartTime = now;
+  probe1State.stableChangeTime = now;
+
+  probe2State.stableState = probe2Raw;
+  probe2State.candidateState = probe2Raw;
+  probe2State.lastRawState = probe2Raw;
+  probe2State.candidateStartTime = now;
+  probe2State.stableChangeTime = now;
+
+  probe3State.stableState = probe3Raw;
+  probe3State.candidateState = probe3Raw;
+  probe3State.lastRawState = probe3Raw;
+  probe3State.candidateStartTime = now;
+  probe3State.stableChangeTime = now;
+}
+
+// ======================================================
+// DIP SWITCH MATRIX AND DECODING FUNCTIONS
+// ======================================================
+
+void setupDipSwitchPins() {
+  /*
+    Rows are inputs.
+    Internal pull-ups are disabled because the board matrix provides the signal.
+  */
+  DIP_ROW_DDR &= ~(
+    (1 << DIP_ROW1_PIN) | (1 << DIP_ROW2_PIN) | (1 << DIP_ROW3_PIN) | (1 << DIP_ROW4_PIN));
+
+  DIP_ROW_PORT &= ~(
+    (1 << DIP_ROW1_PIN) | (1 << DIP_ROW2_PIN) | (1 << DIP_ROW3_PIN) | (1 << DIP_ROW4_PIN));
+
+  /*
+    Columns are outputs for matrix scanning.
+  */
+  DIP_COL_DDR |=
+    (1 << DIP_COL1_PIN) | (1 << DIP_COL2_PIN) | (1 << DIP_COL3_PIN) | (1 << DIP_COL4_PIN);
+
+  deactivateAllDipColumns();
+}
+
+void setDipColumnState(uint8_t colPin, bool active) {
+#if DIP_COLUMN_ACTIVE_HIGH
+  if (active) {
+    DIP_COL_PORT |= (1 << colPin);
+  } else {
+    DIP_COL_PORT &= ~(1 << colPin);
+  }
+#else
+  if (active) {
+    DIP_COL_PORT &= ~(1 << colPin);
+  } else {
+    DIP_COL_PORT |= (1 << colPin);
+  }
+#endif
+}
+
+void deactivateAllDipColumns() {
+#if DIP_COLUMN_ACTIVE_HIGH
+  DIP_COL_PORT &= ~(
+    (1 << DIP_COL1_PIN) | (1 << DIP_COL2_PIN) | (1 << DIP_COL3_PIN) | (1 << DIP_COL4_PIN));
+#else
+  DIP_COL_PORT |=
+    (1 << DIP_COL1_PIN) | (1 << DIP_COL2_PIN) | (1 << DIP_COL3_PIN) | (1 << DIP_COL4_PIN);
+#endif
+}
+
+uint8_t readDipRows() {
+  /*
+    Returned bit format:
+      bit0 = ROW1
+      bit1 = ROW2
+      bit2 = ROW3
+      bit3 = ROW4
+  */
+
+  uint8_t rows = 0;
+
+  bool row1High = (DIP_ROW_PINREG & (1 << DIP_ROW1_PIN)) != 0;
+  bool row2High = (DIP_ROW_PINREG & (1 << DIP_ROW2_PIN)) != 0;
+  bool row3High = (DIP_ROW_PINREG & (1 << DIP_ROW3_PIN)) != 0;
+  bool row4High = (DIP_ROW_PINREG & (1 << DIP_ROW4_PIN)) != 0;
+
+#if DIP_SWITCH_ACTIVE_HIGH
+  if (row1High) rows |= 0x01;
+  if (row2High) rows |= 0x02;
+  if (row3High) rows |= 0x04;
+  if (row4High) rows |= 0x08;
+#else
+  if (!row1High) rows |= 0x01;
+  if (!row2High) rows |= 0x02;
+  if (!row3High) rows |= 0x04;
+  if (!row4High) rows |= 0x08;
+#endif
+
+  return rows;
+}
+
+uint8_t scanDipColumn(uint8_t colNumber) {
+  /*
+    colNumber:
+      1 = COL1
+      2 = COL2
+      3 = COL3
+      4 = COL4
+  */
+
+  deactivateAllDipColumns();
+
+  switch (colNumber) {
+    case 1:
+      setDipColumnState(DIP_COL1_PIN, true);
+      break;
+
+    case 2:
+      setDipColumnState(DIP_COL2_PIN, true);
+      break;
+
+    case 3:
+      setDipColumnState(DIP_COL3_PIN, true);
+      break;
+
+    case 4:
+      setDipColumnState(DIP_COL4_PIN, true);
+      break;
+
+    default:
+      return 0;
+  }
+
+  delayMicroseconds(50);
+
+  uint8_t rows = readDipRows();
+
+  deactivateAllDipColumns();
+
+  return rows;
+}
+
+uint8_t readDipBlock2() {
+  /*
+    U5 = second DIP block:
+      SW1 = Standby disable
+      SW2-SW5 = Max session time
+      SW6-SW8 = Standby duration
+
+    U5 uses:
+      COL2 for SW1-SW4
+      COL1 for SW5-SW8
+
+    Returned bit format:
+      bit0 = SW1
+      bit1 = SW2
+      bit2 = SW3
+      bit3 = SW4
+      bit4 = SW5
+      bit5 = SW6
+      bit6 = SW7
+      bit7 = SW8
+  */
+
+  uint8_t col2Rows = scanDipColumn(2);
+  uint8_t col1Rows = scanDipColumn(1);
+
+  uint8_t dips = 0;
+
+  // COL2 side: SW1-SW4
+  if (col2Rows & 0x08) dips |= (1 << 0);  // SW1 = ROW4
+  if (col2Rows & 0x04) dips |= (1 << 1);  // SW2 = ROW3
+  if (col2Rows & 0x02) dips |= (1 << 2);  // SW3 = ROW2
+  if (col2Rows & 0x01) dips |= (1 << 3);  // SW4 = ROW1
+
+  // COL1 side: SW5-SW8
+  if (col1Rows & 0x08) dips |= (1 << 4);  // SW5 = ROW4
+  if (col1Rows & 0x04) dips |= (1 << 5);  // SW6 = ROW3
+  if (col1Rows & 0x02) dips |= (1 << 6);  // SW7 = ROW2
+  if (col1Rows & 0x01) dips |= (1 << 7);  // SW8 = ROW1
+
+  return dips;
+}
+
+uint8_t readDipBlock1() {
+  /*
+    U6 = first DIP block:
+      DIP8 = Cabin light
+      DIP7 = Fan
+      DIP6 = Scent pump
+      DIP5 = Autodrain valve
+      DIP4 = Temperature range
+      DIP3 = Slave unit
+      DIP2 = Slave number
+      DIP1 = Slave number
+
+    U6 uses:
+      COL4 for SW1-SW4
+      COL3 for SW5-SW8
+
+    Returned bit format:
+      bit0 = SW1
+      bit1 = SW2
+      bit2 = SW3
+      bit3 = SW4
+      bit4 = SW5
+      bit5 = SW6
+      bit6 = SW7
+      bit7 = SW8
+  */
+
+  uint8_t col4Rows = scanDipColumn(4);
+  uint8_t col3Rows = scanDipColumn(3);
+
+  uint8_t dips = 0;
+
+  // COL4 side: SW1-SW4
+  if (col4Rows & 0x08) dips |= (1 << 0);  // SW1 = ROW4
+  if (col4Rows & 0x04) dips |= (1 << 1);  // SW2 = ROW3
+  if (col4Rows & 0x02) dips |= (1 << 2);  // SW3 = ROW2
+  if (col4Rows & 0x01) dips |= (1 << 3);  // SW4 = ROW1
+
+  // COL3 side: SW5-SW8
+  if (col3Rows & 0x08) dips |= (1 << 4);  // SW5 = ROW4
+  if (col3Rows & 0x04) dips |= (1 << 5);  // SW6 = ROW3
+  if (col3Rows & 0x02) dips |= (1 << 6);  // SW7 = ROW2
+  if (col3Rows & 0x01) dips |= (1 << 7);  // SW8 = ROW1
+
+  return dips;
+}
+
+bool dipSwitchOn(uint8_t dipValue, uint8_t switchNumber) {
+  /*
+    switchNumber = 1 to 8
+  */
+
+  if (switchNumber < 1 || switchNumber > 8) {
+    return false;
+  }
+
+  return (dipValue & (1 << (switchNumber - 1))) != 0;
+}
+
+uint16_t decodeMaxSessionTimeMinutes(uint8_t dipBlock2) {
+  /*
+    SW2-SW5 table:
+
+    SW2 SW3 SW4 SW5
+     0   0   0   0  = 10 min
+     0   0   0   1  = 15 min
+     0   0   1   0  = 20 min
+     0   0   1   1  = 30 min
+     0   1   0   0  = 45 min
+     0   1   0   1  = 1 h
+     0   1   1   0  = 2 h
+     0   1   1   1  = 4 h
+     1   0   0   0  = 6 h
+     1   0   0   1  = 8 h
+     1   0   1   0  = 12 h
+     1   0   1   1  = 18 h
+     1   1   0   0  = Unlimited
+     1   1   0   1  = 10 min
+     1   1   1   0  = 10 min
+     1   1   1   1  = 10 min
+  */
+
+  bool sw2 = dipSwitchOn(dipBlock2, 2);
+  bool sw3 = dipSwitchOn(dipBlock2, 3);
+  bool sw4 = dipSwitchOn(dipBlock2, 4);
+  bool sw5 = dipSwitchOn(dipBlock2, 5);
+
+  uint8_t code =
+    (sw2 ? 8 : 0) | (sw3 ? 4 : 0) | (sw4 ? 2 : 0) | (sw5 ? 1 : 0);
+
+  switch (code) {
+    case 0x0: return 10;
+    case 0x1: return 15;
+    case 0x2: return 20;
+    case 0x3: return 30;
+    case 0x4: return 45;
+    case 0x5: return 60;
+    case 0x6: return 120;
+    case 0x7: return 240;
+    case 0x8: return 360;
+    case 0x9: return 480;
+    case 0xA: return 720;
+    case 0xB: return 1080;
+    case 0xC: return TIME_UNLIMITED;
+    case 0xD: return 10;
+    case 0xE: return 10;
+    case 0xF: return 10;
+    default: return 10;
+  }
+}
+
+uint16_t decodeMaxStandbyTimeMinutes(uint8_t dipBlock2) {
+  /*
+    SW6-SW8 table:
+
+    SW6 SW7 SW8
+     0   0   0  = 4 h
+     0   0   1  = 6 h
+     0   1   0  = 12 h
+     0   1   1  = 18 h
+     1   0   0  = Unlimited
+     1   0   1  = 4 h
+     1   1   0  = 4 h
+     1   1   1  = 4 h
+  */
+
+  bool sw6 = dipSwitchOn(dipBlock2, 6);
+  bool sw7 = dipSwitchOn(dipBlock2, 7);
+  bool sw8 = dipSwitchOn(dipBlock2, 8);
+
+  uint8_t code =
+    (sw6 ? 4 : 0) | (sw7 ? 2 : 0) | (sw8 ? 1 : 0);
+
+  switch (code) {
+    case 0x0: return 240;
+    case 0x1: return 360;
+    case 0x2: return 720;
+    case 0x3: return 1080;
+    case 0x4: return TIME_UNLIMITED;
+    case 0x5: return 240;
+    case 0x6: return 240;
+    case 0x7: return 240;
+    default: return 240;
+  }
+}
+
+void loadTimeLimitsFromDipSwitches() {
+  /*
+    Reads U5 second DIP block and loads:
+      - standby disabled setting
+      - max session time
+      - max standby time
+
+    Default start values are the max allowed by DIP switches.
+  */
+
+  dipBlock2Value = readDipBlock2();
+
+  standbyDisabledByDip = dipSwitchOn(dipBlock2Value, 1);
+
+  maxSessionTimeMin = decodeMaxSessionTimeMinutes(dipBlock2Value);
+  maxStandbyTimeMin = decodeMaxStandbyTimeMinutes(dipBlock2Value);
+
+  startSessionTimeMin = maxSessionTimeMin;
+  sessionTimeMin = startSessionTimeMin;
+  sessionRemainingSeconds = minutesToCountdownSeconds(startSessionTimeMin);
+
+  if (standbyDisabledByDip) {
+    startStandbyTimeMin = 0;
+    standbyTimeMin = 0;
+    standbyRemainingSeconds = 0;
+  } else {
+    startStandbyTimeMin = maxStandbyTimeMin;
+    standbyTimeMin = startStandbyTimeMin;
+    standbyRemainingSeconds = minutesToCountdownSeconds(startStandbyTimeMin);
+  }
+}
+
+void loadGeneratorSettingsFromDipSwitches() {
+  /*
+    Reads U6 first DIP block.
+
+    Final multiple steam-generator addressing:
+      000 = Master, always connected to the User Interface.
+      001..111 = Slave 1..7.
+
+    Important:
+      If the UI-connected/single-generator board is accidentally set to a
+      non-zero DIP address, the board is configured as a Slave. Since it will
+      not detect a Master, it will raise E13.
+  */
+
+  uint8_t previousDipBlock1Value = dipBlock1Value;
+  uint8_t previousNodeId = generatorNodeId;
+
+  dipBlock1Value = readDipBlock1();
+
+  bool sw1 = dipSwitchOn(dipBlock1Value, 1);
+  bool sw2 = dipSwitchOn(dipBlock1Value, 2);
+  bool sw3 = dipSwitchOn(dipBlock1Value, 3);
+  bool sw4 = dipSwitchOn(dipBlock1Value, 4);
+  bool sw5 = dipSwitchOn(dipBlock1Value, 5);
+  bool sw6 = dipSwitchOn(dipBlock1Value, 6);
+  bool sw7 = dipSwitchOn(dipBlock1Value, 7);
+  bool sw8 = dipSwitchOn(dipBlock1Value, 8);
+
+  cabinLightDimmerEnabledByDip = sw8;
+
+  generatorNodeId = (sw1 ? 4 : 0) + (sw2 ? 2 : 0) + (sw3 ? 1 : 0);
+  generatorRole = (generatorNodeId == 0) ? GENERATOR_ROLE_MASTER : GENERATOR_ROLE_SLAVE;
+  generatorSlaveNumber = generatorNodeId;
+  localIcscAddress = POWER_CONTROLLER_ADDRESS + generatorNodeId;
+  generatorChainModeSelected = true;
+  generatorDipSettingInvalid = false;
+
+  bool generatorConfigChanged =
+    (previousDipBlock1Value != dipBlock1Value) ||
+    (previousNodeId != generatorNodeId);
+
+  if (generatorConfigChanged) {
+    resetGeneratorChainDetectionTimers();
+    generatorChainModeStartTime = millis();
+  }
+
+  temperatureRangeHighByDip = sw4;
+  updateMaxTemperatureFromDip();
+
+  autoDrainEnabledByDip = sw5;
+  scentPumpEnabledByDip = sw6;
+  fanEnabledByDip = sw7;
+}
+
+
+uint16_t clampTimeToAllowedRange(uint16_t requestedMin, uint16_t maxAllowedMin, uint16_t minimumMin) {
+  /*
+    Used when UI sends selected SessionTime or StandbyTime.
+  */
+
+  if (maxAllowedMin == TIME_UNLIMITED) {
+    if (requestedMin < minimumMin) {
+      return minimumMin;
+    }
+
+    return requestedMin;
+  }
+
+  if (requestedMin < minimumMin) {
+    return minimumMin;
+  }
+
+  if (requestedMin > maxAllowedMin) {
+    return maxAllowedMin;
+  }
+
+  return requestedMin;
+}
+
+void setStartTimesFromUI(uint16_t requestedSessionMin, uint16_t requestedStandbyMin) {
+  /*
+    Called when the UI sends selected SessionTime or StandbyTime.
+    The configured values are stored in minutes, while active countdowns
+    are stored in seconds.
+  */
+
+  startSessionTimeMin =
+    clampTimeToAllowedRange(
+      requestedSessionMin,
+      maxSessionTimeMin,
+      MIN_SESSION_TIME_MIN);
+
+  sessionTimeMin = startSessionTimeMin;
+  sessionRemainingSeconds = minutesToCountdownSeconds(startSessionTimeMin);
+
+  if (standbyDisabledByDip) {
+    startStandbyTimeMin = 0;
+    standbyTimeMin = 0;
+    standbyRemainingSeconds = 0;
+  } else {
+    startStandbyTimeMin =
+      clampTimeToAllowedRange(
+        requestedStandbyMin,
+        maxStandbyTimeMin,
+        MIN_STANDBY_TIME_MIN);
+
+    standbyTimeMin = startStandbyTimeMin;
+    standbyRemainingSeconds = minutesToCountdownSeconds(startStandbyTimeMin);
+  }
+}
+
+
+// ======================================================
+// TEMP FUSE / E5 FUNCTIONS
+// ======================================================
+
+bool readTempFuseRawOk() {
+  /*
+    Reference variant behavior:
+      HIGH = fuse OK
+      LOW  = fuse fault / E5
+
+    If actual board testing proves the logic is reversed, change
+    TEMP_FUSE_OK_ACTIVE_HIGH from 1 to 0.
+  */
+
+  bool pinHigh = ((TEMP_FUSE_PINREG & (1 << TEMP_FUSE_PIN)) != 0);
+
+#if TEMP_FUSE_OK_ACTIVE_HIGH
+  return pinHigh;
+#else
+  return !pinHigh;
+#endif
+}
+
+void updateTempFuseFilter() {
+  /*
+    Non-blocking sample-count filter for E5.
+
+    Equivalent idea to the reference code:
+      fusetotalReading += digitalRead(pin) * 100;
+      after about 100 readings, enough HIGH readings = fuse OK.
+
+    This implementation avoids delay() and does not block the main loop.
+  */
+
+  unsigned long now = millis();
+
+  if ((now - lastTempFuseSampleTime) < TEMP_FUSE_SAMPLE_INTERVAL_MS) {
+    return;
+  }
+
+  lastTempFuseSampleTime = now;
+
+  if (readTempFuseRawOk()) {
+    if (tempFuseOkSampleCount < 255) {
+      tempFuseOkSampleCount++;
+    }
+  }
+
+  tempFuseSampleIndex++;
+
+  if (tempFuseSampleIndex >= TEMP_FUSE_SAMPLE_COUNT) {
+    tempFuseFilteredOk = (tempFuseOkSampleCount >= TEMP_FUSE_MIN_OK_SAMPLES);
+
+    tempFuseSampleIndex = 0;
+    tempFuseOkSampleCount = 0;
+    tempFuseWindowReady = true;
+  }
+}
+
+bool isTempFuseOk() {
+  /*
+    During the first sample window after startup, do not trigger E5 yet.
+    This prevents a false E5 before the filter has enough samples.
+  */
+
+  if (!tempFuseWindowReady) {
+    return true;
+  }
+
+  return tempFuseFilteredOk;
+}
+
+
+// ======================================================
+// CABIN LIGHT / DIP8 / DIMMER FUNCTIONS
+// ======================================================
+
+void setCabinLightOutputRaw(bool on) {
+  /*
+    Directly controls CABLIGHT / PC1.
+
+    In basic mode:
+      this is simple ON/OFF.
+
+    In dimmer mode:
+      this is controlled only by the Timer2 75 us phase-control engine.
+  */
+
+  cabinLightOutputState = on;
+
+  if (on) {
+    CABIN_LIGHT_PORT |= (1 << CABIN_LIGHT_PIN);
+  } else {
+    CABIN_LIGHT_PORT &= ~(1 << CABIN_LIGHT_PIN);
+  }
+}
+
+void convertCabinLightPhaseControl() {
+  /*
+    Converts cabinLightLevelPercent 0..100 to the low-level phase threshold.
+    Higher percentage = earlier firing.
+    Lower percentage  = later firing.
+  */
+
+  uint8_t percent = cabinLightLevelPercent;
+
+  if (!cabinLightDimmerEnabledByDip) {
+    cabinLightPhaseLevelLL = 0;
+    return;
+  }
+
+  if (!cabinLightRequestedOn || percent == 0) {
+    cabinLightPhaseLevelLL = 0;
+    return;
+  }
+
+  /*
+    If changing suddenly from OFF to 100%, wait for proper zero-cross
+    synchronization first. This is copied from the original logic.
+  */
+  if (cabinLightPhaseLevelLL == 0 && percent >= 100) {
+    cabinLightHoldForZeroCrossing = true;
+  }
+
+  uint16_t maxFase;
+  uint8_t minStand;
+
+  if (cabinLightDetected60Hz) {
+    maxFase = CABIN_LIGHT_MAXFASE_60HZ;
+    minStand = CABIN_LIGHT_MINSTAND_60HZ;
+  } else {
+    maxFase = CABIN_LIGHT_MAXFASE_50HZ;
+    minStand = CABIN_LIGHT_MINSTAND_50HZ;
+  }
+
+  if (percent < minStand) {
+    cabinLightPhaseLevelLL = 0;
+    return;
+  }
+
+  if (percent >= 100) {
+    cabinLightPhaseLevelLL = 255 - (maxFase / 100);
+  } else {
+    cabinLightPhaseLevelLL =
+      255 - ((uint32_t)maxFase * (100UL - percent)) / 100UL;
+  }
+}
+
+bool readCabinLightFnetFiltered() {
+  /*
+    Reference-style FNET reader.
+
+    It filters repeated FNET transitions so noise does not retrigger the
+    phase control too quickly.
+  */
+
+  static uint8_t positiveLockout = 0;
+  static uint8_t negativeLockout = 0;
+
+  if (positiveLockout) {
+    positiveLockout--;
+  }
+
+  if (negativeLockout) {
+    negativeLockout--;
+  }
+
+  bool rawFnetHigh = ((FNET_PINREG & (1 << FNET_PIN)) != 0);
+
+  if (rawFnetHigh && !positiveLockout && !cabinLightFnetState) {
+    positiveLockout = CABIN_LIGHT_FNET_LOCKOUT_TICKS;
+    cabinLightFnetState = true;
+  }
+
+  if (!rawFnetHigh && !negativeLockout && cabinLightFnetState) {
+    negativeLockout = CABIN_LIGHT_FNET_LOCKOUT_TICKS;
+    cabinLightFnetState = false;
+  }
+
+  return cabinLightFnetState;
+}
+
+void cabinLightPhaseControlTick() {
+  /*
+    Reference-style phase control.
+    This function is called every 75 us by Timer2.
+  */
+
+  static uint16_t oneSecondTimer = CABIN_LIGHT_PHASE_TICKS_PER_SECOND;
+  static uint8_t periodCounterSum = 0;
+  static uint16_t noFnetTransitionTicks = 0;
+  static bool fnetSynchronized = false;
+
+  if (cabinLightForcedByError) {
+    return;
+  }
+
+  if (!cabinLightDimmerEnabledByDip) {
+    return;
+  }
+
+  if (!cabinLightRequestedOn || cabinLightPhaseLevelLL == 0) {
+    setCabinLightOutputRaw(false);
+    return;
+  }
+
+  bool transitionDetected = false;
+  bool fnetNow = readCabinLightFnetFiltered();
+
+  if (oneSecondTimer) {
+    oneSecondTimer--;
+  }
+
+  if (fnetNow) {
+    if (!cabinLightPreviousPeriod) {
+      cabinLightPreviousPeriod = true;
+      transitionDetected = true;
+
+      periodCounterSum++;
+
+      if (!oneSecondTimer) {
+        oneSecondTimer = CABIN_LIGHT_PHASE_TICKS_PER_SECOND;
+
+        if (periodCounterSum > 55) {
+          cabinLightDetected60Hz = true;
+        } else {
+          cabinLightDetected60Hz = false;
+        }
+
+        periodCounterSum = 0;
+        convertCabinLightPhaseControl();
+      }
+
+      setCabinLightOutputRaw(false);
+
+      cabinLightPhaseCounterNeg = 255 - cabinLightPhaseTimer;
+      cabinLightPhaseTimer = 250;
+      cabinLightAlreadyFired = false;
+    }
+  } else {
+    if (cabinLightPreviousPeriod) {
+      cabinLightPreviousPeriod = false;
+      transitionDetected = true;
+
+      setCabinLightOutputRaw(false);
+
+      cabinLightPhaseCounterPos = 250 - cabinLightPhaseTimer;
+      cabinLightPhaseTimer = 0;
+      cabinLightAlreadyFired = false;
+    }
+  }
+
+  if (transitionDetected) {
+    noFnetTransitionTicks = 0;
+    fnetSynchronized = true;
+  } else {
+    if (noFnetTransitionTicks < CABIN_LIGHT_PHASE_FNET_TIMEOUT_TICKS) {
+      noFnetTransitionTicks++;
+    }
+
+    if (noFnetTransitionTicks >= CABIN_LIGHT_PHASE_FNET_TIMEOUT_TICKS) {
+      fnetSynchronized = false;
+      setCabinLightOutputRaw(false);
+      cabinLightAlreadyFired = false;
+      return;
+    }
+  }
+
+  if (!fnetSynchronized) {
+    setCabinLightOutputRaw(false);
+    return;
+  }
+
+  /*
+    Main phase counter.
+    uint8_t underflow is intentional, same as old byte behavior.
+  */
+  cabinLightPhaseTimer--;
+
+  if (cabinLightPreviousPeriod) {
+    if (cabinLightPhaseTimer <= (250 - cabinLightPhaseCounterPos)) {
+      cabinLightHoldForZeroCrossing = false;
+    }
+
+    if (cabinLightPhaseTimer <= ((250 - cabinLightPhaseCounterPos) + CABIN_LIGHT_ZERO_CROSS_OFF_MARGIN_TICKS)) {
+      setCabinLightOutputRaw(false);
+    }
+  } else {
+    if (cabinLightPhaseTimer <= (255 - cabinLightPhaseCounterNeg)) {
+      cabinLightHoldForZeroCrossing = false;
+    }
+
+    if (cabinLightPhaseTimer <= ((255 - cabinLightPhaseCounterNeg) + CABIN_LIGHT_ZERO_CROSS_OFF_MARGIN_TICKS)) {
+      setCabinLightOutputRaw(false);
+    }
+  }
+
+  /*
+    Fire once per half-cycle.
+    Important: use >, not >=.
+  */
+  if (!cabinLightAlreadyFired && (cabinLightPhaseLevelLL > cabinLightPhaseTimer)) {
+    if (!cabinLightHoldForZeroCrossing) {
+      cabinLightAlreadyFired = true;
+      setCabinLightOutputRaw(true);
+    }
+  }
+}
+
+void setupCabinLightPhaseControlTimer2() {
+  /*
+    Timer2 CTC interrupt every 75 us.
+
+    ATmega32 / MightyCore:
+      Timer2 compare vector = TIMER2_COMP_vect
+      Timer2 register = TCCR2, OCR2
+
+    Timer2 clock:
+      F_CPU / 8
+
+    OCR2 calculation:
+      OCR2 = tick_us * (F_CPU / 1,000,000) / 8 - 1
+  */
+
+  TCCR2 = 0;
+  TCNT2 = 0;
+
+  uint32_t ocrValue =
+    ((F_CPU / 1000000UL) * CABIN_LIGHT_PHASE_TICK_US) / 8UL;
+
+  if (ocrValue > 0) {
+    ocrValue--;
+  }
+
+  if (ocrValue > 255UL) {
+    ocrValue = 255UL;
+  }
+
+  OCR2 = (uint8_t)ocrValue;
+
+  /*
+    CTC mode, prescaler 8:
+      WGM21 = 1
+      CS21  = 1
+  */
+  TCCR2 = (1 << WGM21) | (1 << CS21);
+
+#if defined(OCF2)
+  TIFR |= (1 << OCF2);
+#endif
+
+  TIMSK |= (1 << OCIE2);
+}
+
+ISR(TIMER2_COMP_vect) {
+  cabinLightPhaseControlTick();
+}
+
+void setCabinLightLevelPercent(uint8_t percent) {
+  /*
+    Power Controller receives light level from UI.
+
+    DIP8 OFF:
+      Basic ON/OFF mode.
+      0   = OFF
+      >0  = ON
+
+    DIP8 ON:
+      Reference-style phase dimming.
+      0       = OFF
+      15..100 = phase-controlled brightness
+  */
+
+  if (percent > 100) {
+    percent = 100;
+  }
+
+  percent = (percent / 5) * 5;
+
+  if (percent == 0) {
+    cabinLightLevelPercent = 0;
+    cabinLightRequestedOn = false;
+    cabinLightPhaseLevelLL = 0;
+    cabinLightAlreadyFired = false;
+    cabinLightHoldForZeroCrossing = false;
+
+    setCabinLightOutputRaw(false);
+    return;
+  }
+
+  if (!cabinLightDimmerEnabledByDip) {
+    cabinLightLevelPercent = 100;
+    cabinLightRequestedOn = true;
+    cabinLightPhaseLevelLL = 0;
+    cabinLightAlreadyFired = false;
+    cabinLightHoldForZeroCrossing = false;
+
+    setCabinLightOutputRaw(true);
+    return;
+  }
+
+  cabinLightLevelPercent = percent;
+  cabinLightRequestedOn = true;
+
+  convertCabinLightPhaseControl();
+
+  /*
+    Do not turn ON immediately here.
+    The next FNET transition will synchronize the output.
+  */
+  setCabinLightOutputRaw(false);
+}
+
+void updateCabinLightErrorBehavior() {
+  /*
+    New cabin-light error behavior:
+
+      - When any error/pending error/communication fault first appears,
+        turn the cabin light ON once.
+      - Do not continuously force it ON.
+      - The UI/user can still send cabin-light ON/OFF commands while the
+        error remains active, even while the UI is in OFF/Error state.
+
+    This is intentionally different from the old behavior where the error
+    loop forced the light ON every cycle.
+  */
+
+  bool errorPresent =
+    (pendingFault != FAULT_NONE) ||
+    (activeFault != FAULT_NONE) ||
+    communicationFault;
+
+  if (errorPresent) {
+    if (!cabinLightErrorAutoApplied) {
+      cabinLightErrorAutoApplied = true;
+      cabinLightForcedByError = false;
+
+      cabinLightRequestedOn = true;
+      cabinLightLevelPercent = 100;
+
+      cabinLightPhaseLevelLL = 0;
+      cabinLightAlreadyFired = false;
+      cabinLightHoldForZeroCrossing = false;
+
+      convertCabinLightPhaseControl();
+      setCabinLightOutputRaw(true);
+    }
+    return;
+  }
+
+  cabinLightErrorAutoApplied = false;
+  cabinLightForcedByError = false;
+}
+
+void updateCabinLightDimmer() {
+  /*
+    Reference-style dimmer:
+      Basic mode: main loop controls ON/OFF.
+      Dimmer mode: Timer2 phase-control routine controls output.
+  */
+
+  if (cabinLightForcedByError) {
+    setCabinLightOutputRaw(true);
+    return;
+  }
+
+  if (!cabinLightDimmerEnabledByDip) {
+    if (cabinLightRequestedOn) {
+      setCabinLightOutputRaw(true);
+    } else {
+      setCabinLightOutputRaw(false);
+    }
+
+    return;
+  }
+
+  if (!cabinLightRequestedOn || cabinLightLevelPercent == 0 || cabinLightPhaseLevelLL == 0) {
+    setCabinLightOutputRaw(false);
+    return;
+  }
+
+  /*
+    In dimmer mode, do not force ON or OFF here.
+    Timer2 phase-control owns the output.
+  */
+}
+
+
+// ======================================================
+// SCENT PUMP / DIP6 FUNCTIONS
+// ======================================================
+
+void setScentPumpSetPoint(uint8_t newSetPoint) {
+  /*
+    UI sends set-point from 0 to 20.
+    Values above 20 are clamped to 20.
+  */
+
+  if (newSetPoint > SCENT_PUMP_SETPOINT_CONTINUOUS) {
+    newSetPoint = SCENT_PUMP_SETPOINT_CONTINUOUS;
+  }
+
+  scentPumpSetPoint = newSetPoint;
+
+  // Restart timing cycle whenever set-point changes.
+  scentPumpCycleStartTime = millis();
+
+  if (scentPumpSetPoint == SCENT_PUMP_SETPOINT_OFF) {
+    setScentPumpOutput(false);
+  }
+}
+
+unsigned long getScentPumpIntervalMs(uint8_t setPoint) {
+  /*
+    Scent pump interval table from specification.
+
+    Set-point 1–13 are in minutes.
+    Set-point 14–19 are in seconds.
+    Set-point 20 is continuous ON and handled separately.
+  */
+
+  switch (setPoint) {
+    case 1: return 20UL * 60UL * 1000UL;  // 20 min
+    case 2: return 17UL * 60UL * 1000UL;  // 17 min
+    case 3: return 14UL * 60UL * 1000UL;  // 14 min
+    case 4: return 11UL * 60UL * 1000UL;  // 11 min
+    case 5: return 9UL * 60UL * 1000UL;   // 9 min
+    case 6: return 8UL * 60UL * 1000UL;   // 8 min
+    case 7: return 7UL * 60UL * 1000UL;   // 7 min
+    case 8: return 6UL * 60UL * 1000UL;   // 6 min
+    case 9: return 5UL * 60UL * 1000UL;   // 5 min
+    case 10: return 4UL * 60UL * 1000UL;  // 4 min
+    case 11: return 3UL * 60UL * 1000UL;  // 3 min
+    case 12: return 2UL * 60UL * 1000UL;  // 2 min
+    case 13: return 1UL * 60UL * 1000UL;  // 1 min
+
+    case 14: return 50UL * 1000UL;  // 50 sec
+    case 15: return 40UL * 1000UL;  // 40 sec
+    case 16: return 30UL * 1000UL;  // 30 sec
+    case 17: return 20UL * 1000UL;  // 20 sec
+    case 18: return 10UL * 1000UL;  // 10 sec
+    case 19: return 4UL * 1000UL;   // 4 sec
+
+    default:
+      return 0;
+  }
+}
+
+bool isScentPumpAllowed() {
+  /*
+    Specification:
+      The scent pump is allowed only when:
+      - water in tank is boiling: NTC2 >= 95°C
+      - contactor is ON
+
+    Additional safety:
+      - DIP6 must enable the scent pump feature
+      - system must be ON
+      - no error pending/active
+  */
+
+  if (!scentPumpEnabledByDip) {
+    return false;
+  }
+
+  if (!operationEnabled) {
+    return false;
+  }
+
+  if (pendingFault != FAULT_NONE || activeFault != FAULT_NONE) {
+    return false;
+  }
+
+  bool contactorIsOn = getOutputState(&CONTACTOR_PORT, CONTACTOR_PIN);
+
+  if (!contactorIsOn) {
+    return false;
+  }
+
+  double tankTempC = readNtc2TemperatureC();
+
+  if (tankTempC < SCENT_PUMP_MIN_TEMP_C) {
+    return false;
+  }
+
+  return true;
+}
+
+void updateScentPumpController() {
+  /*
+    Main scent pump controller.
+
+    Set-point:
+      0  = OFF
+      1–19 = ON for 2 seconds every selected interval
+      20 = continuously ON
+
+    Pump is only allowed if:
+      NTC2 >= 95°C AND contactor is ON.
+  */
+
+  if (!isScentPumpAllowed()) {
+    setScentPumpOutput(false);
+    scentPumpCycleStartTime = millis();
+    return;
+  }
+
+  // Set-point 0 = OFF.
+  if (scentPumpSetPoint == SCENT_PUMP_SETPOINT_OFF) {
+    setScentPumpOutput(false);
+    scentPumpCycleStartTime = millis();
+    return;
+  }
+
+  // Set-point 20 = continuously ON.
+  if (scentPumpSetPoint >= SCENT_PUMP_SETPOINT_CONTINUOUS) {
+    setScentPumpOutput(true);
+    return;
+  }
+
+  unsigned long intervalMs = getScentPumpIntervalMs(scentPumpSetPoint);
+
+  if (intervalMs == 0) {
+    setScentPumpOutput(false);
+    scentPumpCycleStartTime = millis();
+    return;
+  }
+
+  unsigned long now = millis();
+  unsigned long elapsed = now - scentPumpCycleStartTime;
+
+  // Restart cycle when interval has elapsed.
+  if (elapsed >= intervalMs) {
+    scentPumpCycleStartTime = now;
+    elapsed = 0;
+  }
+
+  // Pump ON only for the first 2 seconds of each cycle.
+  if (elapsed < SCENT_PUMP_ON_TIME_MS) {
+    setScentPumpOutput(true);
+  } else {
+    setScentPumpOutput(false);
+  }
+}
+
+
+// ======================================================
+// AUTO DRAIN / DIP5 FUNCTIONS
+// ======================================================
+
+void startAutoDrainPreparation() {
+  /*
+    SIMPLE DRAIN TEST VERSION.
+
+    Sequence:
+      Standby time expires or UI force-drain command
+      -> check DIP5
+      -> DIP5 OFF: go OFF immediately
+      -> DIP5 ON: fill until Probe 1 / PA7 detects water
+      -> Fill OFF, Drain ON
+      -> wait until Probe 3 / PC6 no longer detects water
+      -> Drain OFF, go OFF
+
+    Important:
+      - Probe 2 / PC7 is ignored during drain.
+      - Normal fill/contact logic is disabled while autoDrainState is active.
+      - E10 / timeout logic is disabled in this simple test version.
+  */
+
+  /*
+    CRITICAL:
+    Prevent repeated restart of the drain sequence.
+
+    If drain is already filling or draining, do not reset it.
+  */
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    return;
+  }
+
+  if (!operationEnabled) {
+    return;
+  }
+
+  standbyRemainingSeconds = 0;
+  standbyTimeMin = 0;
+
+  forceNormalContactorOff();
+
+  /*
+    Start from a known safe output state.
+  */
+  setAutoFill(false);
+  setAutoDrain(false);
+
+  if (!autoDrainEnabledByDip) {
+    autoDrainState = AUTODRAIN_IDLE;
+    autoDrainFillStarted = false;
+    autoDrainFillStartTime = 0;
+    autoDrainDrainStartTime = 0;
+    autoDrainProbe3OffDetected = false;
+
+    enterOffMode();
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  /*
+    DIP5 ON:
+      Start filling immediately.
+      Probe 2 normal fill logic is intentionally ignored here.
+  */
+  autoDrainState = AUTODRAIN_FILL_TO_PROBE1;
+  autoDrainFillStarted = true;
+  autoDrainFillStartTime = millis();
+  autoDrainDrainStartTime = 0;
+  autoDrainProbe3OffDetected = false;
+
+  setAutoDrain(false);  // Drain OFF
+  setAutoFill(true);    // Fill ON
+
+  sendHeartbeatAckToUI();
+}
+
+void startAutoDrainSequence() {
+  /*
+    Use only one drain starter.
+    This prevents startAutoDrainSequence() and startAutoDrainPreparation()
+    from having different logic and fighting each other.
+  */
+  startAutoDrainPreparation();
+}
+
+void stopAutoDrainSequence() {
+  autoDrainState = AUTODRAIN_IDLE;
+  autoDrainFillStarted = false;
+  autoDrainFillStartTime = 0;
+  autoDrainDrainStartTime = 0;
+  autoDrainProbe3OffDetected = false;
+
+  setAutoFill(false);
+  setAutoDrain(false);
+}
+
+uint32_t getAutoDrainRemainingSeconds() {
+  if (autoDrainState != AUTODRAIN_DRAINING) {
+    return 0;
+  }
+
+  unsigned long elapsedMs = millis() - autoDrainDrainStartTime;
+
+  if (elapsedMs >= AUTODRAIN_DRAIN_TIME_MS) {
+    return 0;
+  }
+
+  unsigned long remainingMs = AUTODRAIN_DRAIN_TIME_MS - elapsedMs;
+  return (uint32_t)((remainingMs + 999UL) / 1000UL);
+}
+
+bool e10AutoDrainFailureDetected() {
+  /*
+    E10:
+      Drain failure.
+
+    Final drain rule:
+      During actual drain, Auto Drain stays ON for the full 10 minutes.
+
+      Probe 3 / PC6 OFF before the 10-minute timeout does NOT stop drain.
+      Instead, it latches autoDrainProbe3OffDetected = true in
+      runAutoDrainSequenceIfActive().
+
+      After the 10-minute timer finishes:
+        - If Probe 3 turned OFF at least once -> drain success.
+        - If Probe 3 never turned OFF        -> E10 drain failure.
+  */
+
+  if (autoDrainState != AUTODRAIN_DRAINING) {
+    return false;
+  }
+
+  if (autoDrainDrainStartTime == 0) {
+    return false;
+  }
+
+  unsigned long elapsedMs = millis() - autoDrainDrainStartTime;
+
+  if (elapsedMs < AUTODRAIN_DRAIN_TIME_MS) {
+    return false;
+  }
+
+  /*
+    Timer expired and Probe 3 never turned OFF during the drain window.
+    This means the tank did not drain below Probe 3 within 10 minutes.
+  */
+  if (!autoDrainProbe3OffDetected) {
+    return true;
+  }
+
+  return false;
+}
+
+void runAutoDrainSequenceIfActive() {
+  if (autoDrainState == AUTODRAIN_IDLE) {
+    return;
+  }
+
+  bool probe1On = false;  // PA7 / level_sense2
+  bool probe2On = false;  // PC7 / level_sense3, ignored during drain
+  bool probe3On = false;  // PC6 / level_sense4
+  readWaterProbes(&probe1On, &probe2On, &probe3On);
+
+  /*
+    Drain has priority over normal system logic:
+      - normal fill logic is disabled
+      - normal contactor logic is disabled
+      - Probe 2 is ignored
+      - Probe 1 ends the filling stage
+      - Probe 3 OFF is latched as drain-success proof
+      - Actual draining still completes the full 10-minute timer
+  */
+  forceNormalContactorOff();
+
+  if (autoDrainState == AUTODRAIN_FILL_TO_PROBE1) {
+    setAutoDrain(false);
+    setAutoFill(true);
+
+    if (probe1On) {
+      setAutoFill(false);
+  
+      autoDrainState = AUTODRAIN_DRAINING;
+      autoDrainFillStarted = false;
+
+      autoDrainDrainStartTime = millis();
+      autoDrainProbe3OffDetected = false;
+
+      setAutoDrain(true);
+
+      sendHeartbeatAckToUI();
+      return;
+    }
+
+    return;
+  }
+
+  if (autoDrainState == AUTODRAIN_DRAINING) {
+    setAutoFill(false);
+    setAutoDrain(true);
+
+    /*
+      New final drain behavior:
+        Probe 3 OFF confirms that the tank has drained below Probe 3,
+        but it does NOT stop the drain immediately.
+
+        Continue draining until the full 10-minute timer completes.
+    */
+    if (!probe3On) {
+      autoDrainProbe3OffDetected = true;
+    }
+
+    unsigned long elapsedMs = millis() - autoDrainDrainStartTime;
+
+    if (elapsedMs >= AUTODRAIN_DRAIN_TIME_MS) {
+      /*
+        If Probe 3 never turned OFF during the 10-minute drain window,
+        updateFaultState() / e10AutoDrainFailureDetected() will handle E10.
+        Do not clear the drain sequence here in that case.
+      */
+      if (!autoDrainProbe3OffDetected) {
+        return;
+      }
+
+      /*
+        Drain successful:
+          Probe 3 turned OFF at least once and the full 10 minutes finished.
+      */
+      setAutoDrain(false);
+      setAutoFill(false);
+
+      autoDrainState = AUTODRAIN_IDLE;
+      autoDrainFillStarted = false;
+      autoDrainFillStartTime = 0;
+      autoDrainDrainStartTime = 0;
+      autoDrainProbe3OffDetected = false;
+
+      enterOffMode();
+      sendHeartbeatAckToUI();
+      return;
+    }
+
+    return;
+  }
+}
+
+// ======================================================
+// WATER-LEVEL FAULT HELPER FUNCTIONS
+// ======================================================
+
+bool isIllogicalWaterLevel(bool probe1On, bool probe2On, bool probe3On) {
+  /*
+    Logical water order from highest to lowest:
+      Probe 1 = highest
+      Probe 2 = middle
+      Probe 3 = lowest
+
+    Normal valid combinations:
+      000 = no water touching probes
+      001 = water reached Probe 3 only
+      011 = water reached Probe 3 and Probe 2
+      111 = water reached all probes
+
+    Illogical:
+      Probe 1 ON while Probe 2 OFF
+      Probe 2 ON while Probe 3 OFF
+  */
+  if (probe1On && !probe2On) {
+    return true;
+  }
+
+  if (probe2On && !probe3On) {
+    return true;
+  }
+
+  return false;
+}
+
+bool e7WaterBelowProbe3Elapsed(bool probe3On) {
+  /*
+    E7:
+      After system ON, Probe 3 / PC6 must detect water within 300 seconds.
+
+    Important latch behavior:
+      When E7 becomes active, updateFaultState() forces operationEnabled = false.
+      The old logic immediately cleared the E7 condition because it returned false
+      when operationEnabled was false. Keep E7 raw-active while Probe 3 is still
+      OFF and E7 is pending/active. This prevents the UI from briefly showing the
+      error and then returning to OFF.
+  */
+
+  if (!operationEnabled &&
+      pendingFault != FAULT_E7_WATER_TOO_LOW &&
+      activeFault != FAULT_E7_WATER_TOO_LOW) {
+    waterBelowProbe3TimerRunning = false;
+    return false;
+  }
+
+  if (probe3On) {
+    waterBelowProbe3TimerRunning = false;
+    return false;
+  }
+
+  if (pendingFault == FAULT_E7_WATER_TOO_LOW ||
+      activeFault == FAULT_E7_WATER_TOO_LOW) {
+    return true;
+  }
+
+  if (!waterBelowProbe3TimerRunning) {
+    waterBelowProbe3TimerRunning = true;
+    waterBelowProbe3StartTime = millis();
+    return false;
+  }
+
+  return ((millis() - waterBelowProbe3StartTime) >= WATER_TIMEOUT_MS);
+}
+
+bool e9FillFailureElapsed(bool probe2On, bool probe3On) {
+  /*
+    E9:
+      Fill failure.
+
+      Interpretation:
+        Probe 3 already detects water, but Probe 2 does not reach water
+        within 300 seconds while filling.
+
+    Important latch behavior:
+      When E9 becomes active, updateFaultState() forces operationEnabled = false.
+      The old logic immediately reset the E9 timer and returned false because
+      operationEnabled was false. That caused the Power Controller to send E9
+      very briefly, then send error = 0, so the UI returned to OFF instead of
+      displaying E9. Keep E9 raw-active while the physical E9 condition remains:
+        Probe 3 ON and Probe 2 OFF.
+  */
+
+  if (!operationEnabled &&
+      pendingFault != FAULT_E9_FILL_FAILURE &&
+      activeFault != FAULT_E9_FILL_FAILURE) {
+    fillToProbe2TimerRunning = false;
+    return false;
+  }
+
+  if (probe2On) {
+    fillToProbe2TimerRunning = false;
+    return false;
+  }
+
+  if (!probe3On) {
+    fillToProbe2TimerRunning = false;
+    return false;
+  }
+
+  if (pendingFault == FAULT_E9_FILL_FAILURE ||
+      activeFault == FAULT_E9_FILL_FAILURE) {
+    return true;
+  }
+
+  /*
+    If we are here:
+      Probe 3 ON
+      Probe 2 OFF
+
+    Auto Fill should be ON in the normal logic, so start the fill timer.
+  */
+  if (!fillToProbe2TimerRunning) {
+    fillToProbe2TimerRunning = true;
+    fillToProbe2StartTime = millis();
+    return false;
+  }
+
+  return ((millis() - fillToProbe2StartTime) >= WATER_TIMEOUT_MS);
+}
+
+
+// ======================================================
+// GENERATOR CHAIN / E13 FUNCTIONS
+// ======================================================
+
+uint8_t slaveMaskBit(uint8_t slaveId) {
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES) {
+    return 0;
+  }
+  return (uint8_t)(1 << (slaveId - 1));
+}
+
+uint8_t slaveAddressFromId(uint8_t slaveId) {
+  return (uint8_t)(POWER_CONTROLLER_ADDRESS + slaveId);
+}
+
+void loadSlaveMasksFromEEPROM() {
+  quarantinedSlaveMask = EEPROM.read(EEPROM_ADDR_QUARANTINED_SLAVE_MASK);
+  manualDisabledSlaveMask = EEPROM.read(EEPROM_ADDR_MANUAL_DISABLED_SLAVE_MASK);
+  quarantinedSlaveMask &= 0x7F;
+  manualDisabledSlaveMask &= 0x7F;
+
+  for (uint8_t id = 1; id <= MAX_GENERATOR_SLAVES; id++) {
+    savedSlaveErrorCode[id] = EEPROM.read(EEPROM_ADDR_SLAVE_ERROR_BASE + id);
+    if (savedSlaveErrorCode[id] > 13) {
+      savedSlaveErrorCode[id] = 0;
+    }
+  }
+}
+
+void saveSlaveMasksToEEPROM() {
+  EEPROM.update(EEPROM_ADDR_QUARANTINED_SLAVE_MASK, quarantinedSlaveMask & 0x7F);
+  EEPROM.update(EEPROM_ADDR_MANUAL_DISABLED_SLAVE_MASK, manualDisabledSlaveMask & 0x7F);
+  for (uint8_t id = 1; id <= MAX_GENERATOR_SLAVES; id++) {
+    EEPROM.update(EEPROM_ADDR_SLAVE_ERROR_BASE + id, savedSlaveErrorCode[id]);
+  }
+}
+
+void recomputeActiveSlaveMask() {
+  activeSlaveMask = startupDetectedSlaveMask & ~(quarantinedSlaveMask | manualDisabledSlaveMask);
+  activeSlaveMask &= 0x7F;
+}
+
+uint8_t getLocalFaultCodeForGeneratorStatus() {
+  if (activeFault != FAULT_NONE) {
+    return (uint8_t)activeFault;
+  }
+  if (pendingFault != FAULT_NONE) {
+    return (uint8_t)pendingFault;
+  }
+  return 0;
+}
+
+uint8_t buildGeneratorCommandMode() {
+  if (activeFault != FAULT_NONE || pendingFault != FAULT_NONE || communicationFault) {
+    return 4;  // error/global stop
+  }
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    return 3;  // drain
+  }
+  if (!operationEnabled) {
+    return 0;  // OFF
+  }
+  return (operationMode == MODE_STANDBY) ? 2 : 1;
+}
+
+void packGeneratorMasterPayload(char *payload, uint8_t forcedCommandMode) {
+  /*
+    Master -> Slave poll/command payload:
+      [0] local address
+      [1] role: 0 master, 1 slave
+      [2] slave number, 0 for master
+      [3] U6 DIP block raw
+      [4] command mode: 0 OFF, 1 SESSION, 2 STANDBY, 3 DRAIN, 4 ERROR/GLOBAL STOP
+      [5] target temperature C
+      [6] fan request
+      [7] cabin light percent
+      [8] scent pump setpoint
+      [9] global error code
+      [10] session heat permission from Master NTC1 control
+
+    forcedCommandMode:
+      255 = use normal buildGeneratorCommandMode()
+      0..4 = force a specific command mode.
+  */
+  uint8_t commandMode = (forcedCommandMode == 255) ? buildGeneratorCommandMode() : forcedCommandMode;
+
+  payload[0] = (char)localIcscAddress;
+  payload[1] = (char)generatorRole;
+  payload[2] = (char)generatorSlaveNumber;
+  payload[3] = (char)dipBlock1Value;
+  payload[4] = (char)commandMode;
+  payload[5] = (char)sessionSetPointC;
+  payload[6] = fanRequested ? 1 : 0;
+  payload[7] = (char)cabinLightLevelPercent;
+  payload[8] = (char)scentPumpSetPoint;
+  payload[9] = (char)activeFault;
+  payload[10] = temperatureHeatDemand ? 1 : 0;
+}
+
+void applyMasterCommandToSlave(char *data, unsigned char len) {
+  if (generatorRole != GENERATOR_ROLE_SLAVE) {
+    return;
+  }
+  if (len < 11 || data == NULL) {
+    return;
+  }
+
+  uint8_t commandMode = (uint8_t)data[4];
+  uint8_t targetTemp = (uint8_t)data[5];
+  bool fanCmd = ((uint8_t)data[6] != 0);
+  uint8_t lightPercent = (uint8_t)data[7];
+  uint8_t scentSet = (uint8_t)data[8];
+  uint8_t globalError = (uint8_t)data[9];
+  masterHeatPermissionFromChain = ((uint8_t)data[10] != 0);
+
+  setSessionSetPointC(targetTemp);
+  setCabinLightLevelPercent(lightPercent);
+  setScentPumpSetPoint(scentSet);
+
+  if (globalError != 0 || commandMode == 4) {
+    enterOffMode();
+    allOutputsOff();
+    return;
+  }
+
+  if (activeFault != FAULT_NONE || pendingFault != FAULT_NONE) {
+    allOutputsOff();
+    return;
+  }
+
+  if (commandMode == 0) {
+    slaveAcceptedMasterOperation = false;
+    enterOffMode();
+    return;
+  }
+
+  slaveAcceptedMasterOperation = true;
+  operationEnabled = true;
+
+  if (commandMode == 1) {
+    setOperationMode(MODE_SESSION);
+  } else if (commandMode == 2) {
+    setOperationMode(MODE_STANDBY);
+  } else if (commandMode == 3) {
+    startAutoDrainPreparation();
+  }
+
+  setFan(fanCmd);
+}
+
+void noteGeneratorBoardSeen(uint8_t remoteAddress, GeneratorRole remoteRole) {
+  if (remoteAddress == localIcscAddress) {
+    return;
+  }
+
+  otherPowerControllerDetected = true;
+  lastOtherPowerControllerSeenTime = millis();
+
+  if (remoteRole == GENERATOR_ROLE_MASTER) {
+    generatorMasterDetected = true;
+    lastGeneratorMasterSeenTime = millis();
+  }
+}
+
+void resetGeneratorChainDetectionTimers() {
+  otherPowerControllerDetected = false;
+  generatorMasterDetected = false;
+  lastOtherPowerControllerSeenTime = 0;
+  lastGeneratorMasterSeenTime = 0;
+  lastGeneratorPresenceSendTime = 0;
+
+  startupDetectedSlaveMask = 0;
+  activeSlaveMask = 0;
+  runtimeLostSlaveMask = 0;
+  currentSlavePollId = 1;
+  masterDiscoveryComplete = false;
+  masterDiscoveryStartTime = millis();
+
+  for (uint8_t id = 1; id <= MAX_GENERATOR_SLAVES; id++) {
+    lastSlaveSeenTime[id] = 0;
+    currentSlaveErrorCode[id] = 0;
+  }
+}
+
+
+void startOffStateSlaveRecoveryScan() {
+  /*
+    Called when the user resets an error by returning to OFF State.
+
+    Corrected STN series-connection rule:
+      - A breaker reset is not required.
+      - OFF State reset rebuilds the active slave list.
+      - Slaves saved in quarantinedSlaveMask remain excluded.
+      - Missing slaves are ignored for this OFF-cycle scan.
+      - Remaining healthy, non-quarantined slaves can operate again.
+  */
+  if (generatorRole != GENERATOR_ROLE_MASTER) {
+    return;
+  }
+
+  resetGeneratorChainDetectionTimers();
+  recomputeActiveSlaveMask();
+}
+
+bool generatorChainReadyForOperation() {
+  if (generatorRole != GENERATOR_ROLE_MASTER) {
+    return true;
+  }
+
+  /*
+    After power-up or OFF-state recovery, wait until the 5-second scan finishes
+    before allowing ON. This prevents the Master from starting before the
+    activeSlaveMask is finalized.
+  */
+  return masterDiscoveryComplete;
+}
+
+void sendGeneratorPollToSlave(uint8_t slaveId) {
+#if ENABLE_ICSC
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES) {
+    return;
+  }
+
+  /*
+    OFF-state recovery / quarantine rule:
+      - During startup discovery or OFF state, the Master may poll every slave
+        so it can build service/status information.
+      - During normal operation, normal commands are sent only to slaves in
+        activeSlaveMask.
+      - Quarantined or manually disabled slaves receive no normal operation
+        command. They may only receive OFF/status polling or global ERROR/OFF.
+  */
+  uint8_t bit = slaveMaskBit(slaveId);
+  uint8_t normalCommandMode = buildGeneratorCommandMode();
+  uint8_t forcedCommandMode = 255;  // 255 = normal command
+
+  if (generatorRole == GENERATOR_ROLE_MASTER) {
+    bool slaveIsActive = ((activeSlaveMask & bit) != 0);
+    bool normalOperationCommand = (normalCommandMode == 1 || normalCommandMode == 2 || normalCommandMode == 3);
+
+    if (normalOperationCommand && !slaveIsActive) {
+      // Excluded slave: status/OFF poll only. No Session/Standby/Drain command.
+      forcedCommandMode = 0;
+    }
+  }
+
+  char payload[11];
+  packGeneratorMasterPayload(payload, forcedCommandMode);
+  ICSC.send(slaveAddressFromId(slaveId), CMD_GENERATOR_PRESENCE, sizeof(payload), payload);
+#endif
+}
+
+void sendGeneratorPresence() {
+#if ENABLE_ICSC
+  if (generatorRole == GENERATOR_ROLE_MASTER) {
+    sendGeneratorPollToSlave(currentSlavePollId);
+    return;
+  }
+
+  // Slave status is sent only as a reply to Master poll to avoid RS485 collisions.
+#endif
+}
+
+void latchSlaveFault(uint8_t slaveId, uint8_t errorCode) {
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES || errorCode == 0) {
+    return;
+  }
+  if (errorCode > 13) {
+    errorCode = 13;
+  }
+
+  uint8_t bit = slaveMaskBit(slaveId);
+  quarantinedSlaveMask |= bit;
+  activeSlaveMask &= ~bit;
+  startupDetectedSlaveMask &= ~bit;
+  savedSlaveErrorCode[slaveId] = errorCode;
+  currentSlaveErrorCode[slaveId] = errorCode;
+  saveSlaveMasksToEEPROM();
+
+  activeSlaveFaultFromChain = true;
+  activeSlaveFaultId = slaveId;
+  activeSlaveFaultError = errorCode;
+
+  activeFault = (FaultCode)errorCode;
+  pendingFault = FAULT_NONE;
+  pendingFaultStartTime = 0;
+  operationEnabled = false;
+  allOutputsOff();
+  sendErrorToUI();
+}
+
+void updateGeneratorPresenceBroadcast() {
+#if ENABLE_ICSC
+  unsigned long now = millis();
+
+  if (generatorRole == GENERATOR_ROLE_MASTER) {
+    if ((now - lastGeneratorPresenceSendTime) >= GENERATOR_SLAVE_POLL_INTERVAL_MS) {
+      lastGeneratorPresenceSendTime = now;
+      sendGeneratorPollToSlave(currentSlavePollId);
+      currentSlavePollId++;
+      if (currentSlavePollId > MAX_GENERATOR_SLAVES) {
+        currentSlavePollId = 1;
+      }
+    }
+
+    if (!masterDiscoveryComplete && ((now - masterDiscoveryStartTime) >= GENERATOR_STARTUP_DISCOVERY_MS)) {
+      masterDiscoveryComplete = true;
+      recomputeActiveSlaveMask();
+    }
+
+    if (masterDiscoveryComplete) {
+      for (uint8_t id = 1; id <= MAX_GENERATOR_SLAVES; id++) {
+        uint8_t bit = slaveMaskBit(id);
+        if ((activeSlaveMask & bit) == 0) {
+          continue;
+        }
+        if (lastSlaveSeenTime[id] != 0 && ((now - lastSlaveSeenTime[id]) > GENERATOR_PRESENCE_TIMEOUT_MS)) {
+          runtimeLostSlaveMask |= bit;
+          latchSlaveFault(id, FAULT_E13_NO_GENERATOR_CHAIN);
+          break;
+        }
+      }
+    }
+  }
+#endif
+}
+
+bool isGeneratorMasterPresent() {
+  if (generatorRole == GENERATOR_ROLE_MASTER) {
+    return true;
+  }
+  if (!generatorMasterDetected) {
+    return false;
+  }
+  return ((millis() - lastGeneratorMasterSeenTime) <= GENERATOR_PRESENCE_TIMEOUT_MS);
+}
+
+bool isGeneratorSlavePresent() {
+  // Master no longer requires any slave at startup. Missing slaves are ignored.
+  return true;
+}
+
+bool isOtherPowerControllerPresent() {
+  if (generatorRole == GENERATOR_ROLE_SLAVE) {
+    return isGeneratorMasterPresent();
+  }
+  return true;
+}
+
+bool shouldTriggerE13() {
+  unsigned long now = millis();
+
+  if (generatorRole == GENERATOR_ROLE_SLAVE) {
+    if ((now - generatorChainModeStartTime) < GENERATOR_PRESENCE_TIMEOUT_MS) {
+      return false;
+    }
+    return !isGeneratorMasterPresent();
+  }
+
+  // Master-side E13 is latched through latchSlaveFault(Sx, E13) when an active slave disappears.
+  return false;
+}
+
+uint8_t getServiceStatusForSlave(uint8_t slaveId, uint8_t *errorCode) {
+  if (errorCode != NULL) {
+    *errorCode = 0;
+  }
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES) {
+    return 0; // --
+  }
+
+  uint8_t bit = slaveMaskBit(slaveId);
+
+  if (quarantinedSlaveMask & bit) {
+    if (errorCode != NULL) {
+      *errorCode = savedSlaveErrorCode[slaveId] ? savedSlaveErrorCode[slaveId] : currentSlaveErrorCode[slaveId];
+    }
+    return 2; // Ex
+  }
+
+  if (manualDisabledSlaveMask & bit) {
+    return 3; // OF
+  }
+
+  if (activeSlaveMask & bit) {
+    return 1; // OK
+  }
+
+  return 0; // --
+}
+
+void sendSlaveStatusToUI(uint8_t slaveId) {
+#if ENABLE_ICSC
+  if (generatorRole != GENERATOR_ROLE_MASTER) {
+    return;
+  }
+  uint8_t errorCode = 0;
+  uint8_t status = getServiceStatusForSlave(slaveId, &errorCode);
+  char payload[3];
+  payload[0] = (char)slaveId;
+  payload[1] = (char)status;    // 0=--, 1=OK, 2=Ex, 3=OF
+  payload[2] = (char)errorCode;
+  ICSC.send(UI_ADDRESS, CMD_SLAVE_STATUS_REPLY, sizeof(payload), payload);
+#endif
+}
+
+void setServiceStatusForSlave(uint8_t slaveId, uint8_t requestedStatus) {
+  if (generatorRole != GENERATOR_ROLE_MASTER) {
+    return;
+  }
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES) {
+    return;
+  }
+
+  uint8_t bit = slaveMaskBit(slaveId);
+
+  if (requestedStatus == 3) { // OF
+    manualDisabledSlaveMask |= bit;
+    quarantinedSlaveMask &= ~bit;
+    savedSlaveErrorCode[slaveId] = 0;
+  } else { // OK/enabled
+    manualDisabledSlaveMask &= ~bit;
+    quarantinedSlaveMask &= ~bit;
+    savedSlaveErrorCode[slaveId] = 0;
+  }
+
+  saveSlaveMasksToEEPROM();
+  recomputeActiveSlaveMask();
+  sendSlaveStatusToUI(slaveId);
+}
+
+void onSlaveStatusRequest(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  if (station != UI_ADDRESS || generatorRole != GENERATOR_ROLE_MASTER) {
+    return;
+  }
+  uint8_t slaveId = 1;
+  if (len >= 1 && data != NULL) {
+    slaveId = (uint8_t)data[0];
+  }
+  sendSlaveStatusToUI(slaveId);
+}
+
+void onSlaveServiceSet(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  if (station != UI_ADDRESS || generatorRole != GENERATOR_ROLE_MASTER) {
+    return;
+  }
+  if (len < 2 || data == NULL) {
+    return;
+  }
+  uint8_t slaveId = (uint8_t)data[0];
+  uint8_t requestedStatus = (uint8_t)data[1]; // 1=OK, 3=OF
+  setServiceStatusForSlave(slaveId, requestedStatus);
+
+#if ENABLE_ICSC
+  char payload[2];
+  payload[0] = (char)slaveId;
+  payload[1] = (char)requestedStatus;
+  ICSC.send(UI_ADDRESS, CMD_SLAVE_SERVICE_ACK, sizeof(payload), payload);
+#endif
+}
+
+// ======================================================
+// FAULT DETECTION FUNCTIONS
+// ======================================================
+
+unsigned long getFaultActivationDelay(FaultCode fault) {
+  /*
+    All detected errors are confirmed after 3 seconds.
+
+    Safety outputs are still turned OFF immediately
+    when a raw error is detected.
+  */
+
+  if (fault == FAULT_NONE) {
+    return 0;
+  }
+
+  // E13 already contains the 5-second master/slave ACK timeout.
+  // Do not add an extra 1-second confirmation delay.
+  if (fault == FAULT_E13_NO_GENERATOR_CHAIN) {
+    return 0;
+  }
+
+  return ERROR_CONFIRM_DELAY_MS;
+}
+
+FaultCode detectRawFault() {
+  /*
+    Final fault priority, v49:
+      1.  E12 = Over-temperature
+      2.  E11 = Communication error
+      3.  E5  = Temp fuse
+      4.  E13 = Generator chain / slave-master communication error
+      5.  E10 = Drain failure
+      6.  E8  = Illogical water level
+      7.  E6  = Water too high
+      8.  E7  = Water below Probe 3 timeout
+      9.  E9  = Fill failure
+      10. E3  = NTC2 open
+      11. E4  = NTC2 short
+      12. E1  = NTC1 open
+      13. E2  = NTC1 short
+
+    Note:
+      E12 is checked only when the NTC1 ADC value is valid. If NTC1 is open
+      or shorted, E1/E2 is used instead of E12.
+  */
+
+  /*
+    E12: over-temperature protection for cabin/session temperature.
+
+    NTC2 is the tank sensor used for Standby control around 83-87°C.
+    Therefore NTC2 must NOT be compared against maxTempC + 10°C.
+
+    E12 is allowed to override an already active/pending error, so it is also
+    checked while an error is latched. It is not used as a normal OFF-state
+    error unless the controller is already in operation/error handling.
+  */
+  bool shouldCheckE12 =
+    operationEnabled ||
+    activeFault != FAULT_NONE ||
+    pendingFault != FAULT_NONE;
+
+  if (shouldCheckE12 && ntc1AdcFilter.ready) {
+    uint16_t ntc1 = getNtc1AdcAverageOrLast();
+
+    if (ntc1 > NTC_SHORT_THRESHOLD && ntc1 < NTC_OPEN_THRESHOLD) {
+      double ntc1TempC = calibrateTemperature(thermistorToCelsius(ntc1));
+
+      if (ntc1TempC >= getE12TriggerTempC()) {
+        return FAULT_E12_OVER_TEMP;
+      }
+    }
+  }
+
+  // E11: communication failure.
+  // This becomes true when UI heartbeat is missing.
+  if (communicationFault) {
+    return FAULT_E11_COMMUNICATION;
+  }
+
+  // E5: temperature fuse.
+  if (!isTempFuseOk()) {
+    return FAULT_E5_TEMP_FUSE;
+  }
+
+  // E13: generator chain / slave-master communication error.
+  if (shouldTriggerE13()) {
+    return FAULT_E13_NO_GENERATOR_CHAIN;
+  }
+
+  bool probe1On = false;
+  bool probe2On = false;
+  bool probe3On = false;
+  readWaterProbes(&probe1On, &probe2On, &probe3On);
+
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    /*
+      During the drain sequence, water levels are intentionally changing.
+      Do not trigger normal water-level faults E6/E7/E8/E9 here.
+      Drain-specific failures are handled only as E10.
+    */
+    if (e10AutoDrainFailureDetected()) {
+      return FAULT_E10_DRAIN_FAILURE;
+    }
+  } else {
+    // E8: illogical water-level combination.
+    if (isIllogicalWaterLevel(probe1On, probe2On, probe3On)) {
+      return FAULT_E8_LEVEL_LOGIC;
+    }
+
+    // E6: water too high.
+    // Trigger during operation when all three probes detect water.
+    // Keep E6 latched while the same physical condition is still present,
+    // even after the system has been forced OFF.
+    if ((operationEnabled || pendingFault == FAULT_E6_WATER_TOO_HIGH || activeFault == FAULT_E6_WATER_TOO_HIGH) && probe1On && probe2On && probe3On) {
+      return FAULT_E6_WATER_TOO_HIGH;
+    }
+
+    // E7: Probe 3 did not detect water within 300 seconds.
+    if (e7WaterBelowProbe3Elapsed(probe3On)) {
+      return FAULT_E7_WATER_TOO_LOW;
+    }
+
+    // E9: Probe 2 did not detect water within 300 seconds after Probe 3.
+    if (e9FillFailureElapsed(probe2On, probe3On)) {
+      return FAULT_E9_FILL_FAILURE;
+    }
+  }
+
+  /*
+    NTC open/short faults using 300-sample averaged ADC values.
+
+    During the first averaging window after reset, do not trigger E1-E4 yet.
+    This prevents a startup ADC transient from latching a false NTC error.
+  */
+  if (ntcAdcAveragesReady()) {
+    uint16_t ntc1 = getNtc1AdcAverageOrLast();
+    uint16_t ntc2 = getNtc2AdcAverageOrLast();
+
+    // E3/E4: NTC2 faults.
+    if (ntc2 >= NTC_OPEN_THRESHOLD) {
+      return FAULT_E3_NTC2_OPEN;
+    }
+
+    if (ntc2 <= NTC_SHORT_THRESHOLD) {
+      return FAULT_E4_NTC2_SHORT;
+    }
+
+    // E1/E2: NTC1 faults.
+    if (ntc1 >= NTC_OPEN_THRESHOLD) {
+      return FAULT_E1_NTC1_OPEN;
+    }
+
+    if (ntc1 <= NTC_SHORT_THRESHOLD) {
+      return FAULT_E2_NTC1_SHORT;
+    }
+  }
+
+  return FAULT_NONE;
+}
+
+
+// ======================================================
+// ICSC SEND FUNCTIONS
+// ======================================================
+
+void sendErrorToUI() {
+#if ENABLE_ICSC
+  /*
+    Payload formats:
+      [0] errorCode                         -> Master/local error
+      [0] errorCode, [1]=1, [2]=slaveId     -> Slave error Sx/Ex
+  */
+  if (activeSlaveFaultFromChain && activeSlaveFaultId >= 1 && activeSlaveFaultId <= MAX_GENERATOR_SLAVES) {
+    char payload[3];
+    payload[0] = (char)activeSlaveFaultError;
+    payload[1] = 1;
+    payload[2] = (char)activeSlaveFaultId;
+    ICSC.send(UI_ADDRESS, CMD_ERROR_REPORT, sizeof(payload), payload);
+  } else {
+    char payload[1];
+    payload[0] = (char)activeFault;
+    ICSC.send(UI_ADDRESS, CMD_ERROR_REPORT, sizeof(payload), payload);
+  }
+#endif
+
+  lastErrorSendTime = millis();
+}
+
+void sendErrorOffToUI() {
+#if ENABLE_ICSC
+  char payload[1];
+  payload[0] = 0;
+
+  ICSC.send(UI_ADDRESS, CMD_ERROR_REPORT, sizeof(payload), payload);
+#endif
+
+  activeSlaveFaultFromChain = false;
+  activeSlaveFaultId = 0;
+  activeSlaveFaultError = 0;
+  lastErrorSendTime = millis();
+}
+
+void periodicErrorSend() {
+  if (activeFault == FAULT_NONE) {
+    return;
+  }
+
+  if ((millis() - lastErrorSendTime) >= ERROR_SEND_INTERVAL_MS) {
+    sendErrorToUI();
+  }
+}
+
+void packUint32ToPayload(char *payload, uint8_t index, uint32_t value) {
+  payload[index + 0] = (char)(value & 0xFF);
+  payload[index + 1] = (char)((value >> 8) & 0xFF);
+  payload[index + 2] = (char)((value >> 16) & 0xFF);
+  payload[index + 3] = (char)((value >> 24) & 0xFF);
+}
+
+int8_t floorTemperatureForDisplay(double tempC) {
+  /*
+    Group standard for displayed temperatures:
+      - No decimal point on the User Interface.
+      - Use floor conversion, not rounding.
+
+    Important flash-size note:
+      Do NOT call floor() here. On small AVR builds, linking floor() can push
+      the sketch over the 16 KB flash limit.
+
+    Manual floor examples:
+      40.9°C  -> 40°C
+      40.1°C  -> 40°C
+      -2.1°C  -> -3°C
+  */
+
+  if (tempC >= 127.0) {
+    return 127;
+  }
+
+  if (tempC <= -128.0) {
+    return -128;
+  }
+
+  int8_t truncated = (int8_t)tempC;
+
+  /*
+    C/C++ cast truncates toward zero.
+    For negative non-integer values, subtract 1 to make it true floor.
+  */
+  if (tempC < 0.0 && ((double)truncated > tempC)) {
+    truncated--;
+  }
+
+  return truncated;
+}
+
+void sendHeartbeatAckToUI() {
+#if ENABLE_ICSC
+  /*
+    Payload:
+      [0] controller state
+          0 = OFF
+          1 = ON
+          2 = ERROR
+          3 = COMMUNICATION FAULT
+      [1] operation mode: 0 = Session, 1 = Standby
+      [2..5]   remaining SessionTime in seconds, uint32 little-endian
+      [6..9]   remaining StandbyTime in seconds, uint32 little-endian
+      [10]     Auto Drain state: 0=idle, 1=filling to Probe1, 2=draining
+      [11..14] remaining Auto Drain time in seconds, uint32 little-endian
+      [15]     NTC1 / cabin actual temperature, floored signed int8 Celsius
+      [16]     NTC2 / tank actual temperature, floored signed int8 Celsius
+
+    TIME_UNLIMITED is sent as 0xFFFFFFFF.
+  */
+
+  char payload[17];
+
+  if (communicationFault) {
+    payload[0] = 3;
+  } else if (activeFault != FAULT_NONE) {
+    payload[0] = 2;
+  } else if (operationEnabled) {
+    payload[0] = 1;
+  } else {
+    payload[0] = 0;
+  }
+
+  payload[1] = (char)operationMode;
+  packUint32ToPayload(payload, 2, sessionRemainingSeconds);
+  packUint32ToPayload(payload, 6, standbyRemainingSeconds);
+  payload[10] = (char)autoDrainState;
+  packUint32ToPayload(payload, 11, getAutoDrainRemainingSeconds());
+
+  int8_t ntc1Temp = 0;
+  int8_t ntc2Temp = 0;
+
+  uint16_t ntc1Adc = getNtc1AdcAverageOrLast();
+  uint16_t ntc2Adc = getNtc2AdcAverageOrLast();
+
+  if (ntc1Adc > NTC_SHORT_THRESHOLD && ntc1Adc < NTC_OPEN_THRESHOLD) {
+    ntc1Temp = floorTemperatureForDisplay(calibrateTemperature(thermistorToCelsius(ntc1Adc)));
+  }
+
+  if (ntc2Adc > NTC_SHORT_THRESHOLD && ntc2Adc < NTC_OPEN_THRESHOLD) {
+    ntc2Temp = floorTemperatureForDisplay(calibrateTemperature(thermistorToCelsius(ntc2Adc)));
+  }
+
+  payload[15] = (char)ntc1Temp;
+  payload[16] = (char)ntc2Temp;
+
+  ICSC.send(UI_ADDRESS, CMD_HEARTBEAT_ACK, sizeof(payload), payload);
+#endif
+}
+
+void sendHeartbeatToUI() {
+#if ENABLE_ICSC
+  /*
+    Legacy compatibility only.
+
+    New half-duplex heartbeat rule:
+      UI is the master.
+      Power Controller replies to UI heartbeat with CMD_HEARTBEAT_ACK.
+      Power Controller must not transmit independent periodic heartbeat
+      requests, because the RS485 bus is half-duplex.
+
+    This function is intentionally not called by updateBidirectionalHeartbeat().
+  */
+
+  char payload[1];
+  payload[0] = 1;
+
+  ICSC.send(UI_ADDRESS, CMD_HEARTBEAT, sizeof(payload), payload);
+  lastHeartbeatSendTime = millis();
+#endif
+}
+
+void updateBidirectionalHeartbeat() {
+#if ENABLE_ICSC
+  /*
+    Disabled by design.
+
+    Half-duplex RS485 must avoid both boards transmitting heartbeat packets at
+    the same time. The UI sends CMD_HEARTBEAT every 1 second, and this Power
+    Controller only replies inside onHeartbeat().
+  */
+#endif
+}
+
+void sendPowerOnAckToUI(bool accepted) {
+#if ENABLE_ICSC
+  char payload[1];
+  payload[0] = accepted ? 1 : 0;
+
+  ICSC.send(UI_ADDRESS, CMD_POWER_ON_ACK, sizeof(payload), payload);
+#endif
+}
+
+void sendUiSettingsAckToUI() {
+#if ENABLE_ICSC
+  char payload[5];
+  payload[0] = (char)sessionSetPointC;
+  payload[1] = (char)(startSessionTimeMin & 0xFF);
+  payload[2] = (char)((startSessionTimeMin >> 8) & 0xFF);
+  payload[3] = (char)maxTempC;
+  payload[4] = (char)(maxSessionTimeMin == TIME_UNLIMITED ? 1 : 0);
+
+  ICSC.send(UI_ADDRESS, CMD_UI_SETTINGS_ACK, sizeof(payload), payload);
+#endif
+}
+
+void sendVersionToUI() {
+#if ENABLE_ICSC
+  char payload[2];
+  payload[0] = PC_VERSION_MAJOR;
+  payload[1] = PC_VERSION_MINOR;
+
+  ICSC.send(UI_ADDRESS, CMD_VERSION_REPLY, sizeof(payload), payload);
+#endif
+}
+
+void sendTemperaturesToUI() {
+#if ENABLE_ICSC
+  /*
+    Send calculated temperatures as floored signed integer Celsius values.
+
+    Payload:
+      [0] NTC1 temperature, signed char
+      [1] NTC2 temperature, signed char
+
+    Example:
+      25 = 25 °C
+      60 = 60 °C
+  */
+
+  uint16_t ntc1Adc = getNtc1AdcAverageOrLast();
+  uint16_t ntc2Adc = getNtc2AdcAverageOrLast();
+
+  int8_t ntc1Temp = 0;
+  int8_t ntc2Temp = 0;
+
+  if (ntc1Adc > NTC_SHORT_THRESHOLD && ntc1Adc < NTC_OPEN_THRESHOLD) {
+    ntc1Temp = floorTemperatureForDisplay(calibrateTemperature(thermistorToCelsius(ntc1Adc)));
+  }
+
+  if (ntc2Adc > NTC_SHORT_THRESHOLD && ntc2Adc < NTC_OPEN_THRESHOLD) {
+    ntc2Temp = floorTemperatureForDisplay(calibrateTemperature(thermistorToCelsius(ntc2Adc)));
+  }
+
+  char payload[2];
+  payload[0] = (char)ntc1Temp;
+  payload[1] = (char)ntc2Temp;
+
+  ICSC.send(UI_ADDRESS, CMD_TEMPERATURES, sizeof(payload), payload);
+#endif
+}
+
+void sendStatusToUI() {
+#if ENABLE_ICSC
+  bool probe1On = false;
+  bool probe2On = false;
+  bool probe3On = false;
+  readWaterProbes(&probe1On, &probe2On, &probe3On);
+
+  /*
+    Payload:
+      [0] Power Controller state
+          0 = OFF
+          1 = ON
+          2 = ERROR
+          3 = COMMUNICATION FAULT
+
+      [1] Active fault code, 0..10
+      [2] Pending fault code, 0..10
+      [3] Operation enabled, 0/1
+      [4] Communication fault, 0/1
+      [5] Probe 1 / PA7 state, 0/1
+      [6] Probe 2 / PC7 state, 0/1
+      [7] Probe 3 / PC6 state, 0/1
+      [8] Temp fuse OK, 0/1
+      [9] Contactor output state, 0/1
+      [10] Auto Fill output state, 0/1
+      [11] Auto Drain state: 0=idle, 1=filling to Probe1, 2=draining
+  */
+
+  char payload[12];
+
+  if (communicationFault) {
+    payload[0] = 3;
+  } else if (activeFault != FAULT_NONE) {
+    payload[0] = 2;
+  } else if (operationEnabled) {
+    payload[0] = 1;
+  } else {
+    payload[0] = 0;
+  }
+
+  payload[1] = (char)activeFault;
+  payload[2] = (char)pendingFault;
+  payload[3] = operationEnabled ? 1 : 0;
+  payload[4] = communicationFault ? 1 : 0;
+  payload[5] = probe1On ? 1 : 0;
+  payload[6] = probe2On ? 1 : 0;
+  payload[7] = probe3On ? 1 : 0;
+  payload[8] = isTempFuseOk() ? 1 : 0;
+  payload[9] = getOutputState(&CONTACTOR_PORT, CONTACTOR_PIN) ? 1 : 0;
+  payload[10] = getOutputState(&AUTOFILL_PORT, AUTOFILL_PIN) ? 1 : 0;
+  payload[11] = (char)autoDrainState;
+
+  ICSC.send(UI_ADDRESS, CMD_STATUS_REPLY, sizeof(payload), payload);
+#endif
+}
+
+void sendDipSettingsToUI() {
+#if ENABLE_ICSC
+  loadTimeLimitsFromDipSwitches();
+  loadGeneratorSettingsFromDipSwitches();
+
+  char payload[11];
+
+  payload[0] = (char)dipBlock2Value;
+
+  payload[1] = (char)(maxSessionTimeMin & 0xFF);
+  payload[2] = (char)((maxSessionTimeMin >> 8) & 0xFF);
+
+  payload[3] = (char)(maxStandbyTimeMin & 0xFF);
+  payload[4] = (char)((maxStandbyTimeMin >> 8) & 0xFF);
+
+  payload[5] = standbyDisabledByDip ? 1 : 0;
+
+  payload[6] = (char)(startSessionTimeMin & 0xFF);
+  payload[7] = (char)((startSessionTimeMin >> 8) & 0xFF);
+
+  payload[8] = (char)(startStandbyTimeMin & 0xFF);
+  payload[9] = (char)((startStandbyTimeMin >> 8) & 0xFF);
+  payload[10] = (char)maxTempC;  // 50 or 55 depending on U6 DIP4
+
+  ICSC.send(UI_ADDRESS, CMD_DIP_REPLY, sizeof(payload), payload);
+#endif
+}
+
+void sendFanStatusToUI() {
+#if ENABLE_ICSC
+  /*
+    Payload:
+      [0] requested state, 0/1
+      [1] DIP7 enabled, 0/1
+      [2] actual output state, 0/1
+  */
+
+  char payload[3];
+
+  payload[0] = fanRequested ? 1 : 0;
+  payload[1] = fanEnabledByDip ? 1 : 0;
+  payload[2] = getOutputState(&FAN_PORT, FAN_PIN) ? 1 : 0;
+
+  ICSC.send(UI_ADDRESS, CMD_FAN_STATUS, sizeof(payload), payload);
+#endif
+}
+
+void sendScentPumpStatusToUI() {
+#if ENABLE_ICSC
+  /*
+    Payload:
+      [0] set-point, 0–20
+      [1] DIP6 enabled, 0/1
+      [2] allowed now, 0/1
+      [3] actual output state, 0/1
+  */
+
+  char payload[4];
+
+  payload[0] = (char)scentPumpSetPoint;
+  payload[1] = scentPumpEnabledByDip ? 1 : 0;
+  payload[2] = isScentPumpAllowed() ? 1 : 0;
+  payload[3] = scentPumpOutputState ? 1 : 0;
+
+  ICSC.send(UI_ADDRESS, CMD_SCENT_PUMP_STATUS, sizeof(payload), payload);
+#endif
+}
+
+void sendCabinLightStatusToUI() {
+#if ENABLE_ICSC
+  /*
+    Payload:
+      [0] DIP8 dimmer enabled, 0/1
+      [1] requested ON, 0/1
+      [2] level percent, 0..100
+      [3] actual PC1 output state, 0/1
+  */
+
+  char payload[4];
+
+  payload[0] = cabinLightDimmerEnabledByDip ? 1 : 0;
+  payload[1] = cabinLightRequestedOn ? 1 : 0;
+  payload[2] = (char)cabinLightLevelPercent;
+  payload[3] = cabinLightOutputState ? 1 : 0;
+
+  ICSC.send(UI_ADDRESS, CMD_CABIN_LIGHT_STATUS, sizeof(payload), payload);
+#endif
+}
+
+
+// ======================================================
+// STARTUP / OFF-STATE FAULT VALIDATION FUNCTIONS
+// ======================================================
+
+bool startupFaultValidationReady() {
+  /*
+    Wait until the startup/version-display validation window has passed and
+    the non-blocking filters have produced valid data.
+
+    This prevents ON acceptance before:
+      - the Temp Fuse filter completes its first sample window
+      - the 300-sample NTC averages are ready
+      - the UI has enough time to finish the visible version-display stage
+  */
+
+  if ((millis() - controllerStartupTime) < STARTUP_FAULT_VALIDATION_MIN_MS) {
+    return false;
+  }
+
+  if (!tempFuseWindowReady) {
+    return false;
+  }
+
+  if (!ntcAdcAveragesReady()) {
+    return false;
+  }
+
+  return true;
+}
+
+void validateAndClearFixedFaultWhileOff() {
+  /*
+    OFF-state validation rule:
+      - Do not clear an active error while the UI/system is still in ON/error.
+      - Once the user manually goes OFF, the Power Controller may check the
+        real physical inputs.
+      - If the physical fault is already fixed, clear the stored error.
+      - If the physical fault is still present, keep the stored error.
+  */
+
+  if (uiRequestedOnState || operationEnabled) {
+    return;
+  }
+
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    return;
+  }
+
+  if (!startupFaultValidationReady()) {
+    return;
+  }
+
+  FaultCode rawFault = detectRawFault();
+
+  if (rawFault == FAULT_NONE) {
+    bool hadStoredFault =
+      (activeFault != FAULT_NONE) ||
+      (pendingFault != FAULT_NONE) ||
+      communicationFault;
+
+    activeFault = FAULT_NONE;
+    pendingFault = FAULT_NONE;
+    pendingFaultStartTime = 0;
+    communicationFault = false;
+
+    waterBelowProbe3TimerRunning = false;
+    fillToProbe2TimerRunning = false;
+
+    if (hadStoredFault) {
+      sendErrorOffToUI();
+      sendHeartbeatAckToUI();
+    }
+  }
+}
+
+// ======================================================
+// FAULT STATE MACHINE
+// ======================================================
+
+void clearActiveFault() {
+  if (activeFault != FAULT_NONE) {
+    activeFault = FAULT_NONE;
+    sendErrorOffToUI();
+  }
+}
+
+void updateFaultState() {
+  FaultCode rawFault = detectRawFault();
+  unsigned long now = millis();
+
+  /*
+    Manual-reset error latch rule:
+      - While the system is ON/error, an active error stays latched even if the
+        physical fault is fixed.
+      - After the user manually goes OFF, the Power Controller validates the
+        real physical inputs while OFF.
+      - If the fault is fixed in OFF state, the stored error clears and the next
+        S6 press can start normally.
+      - If the fault is still present in OFF state, the stored error remains and
+        the next S6 press is rejected / error is shown again.
+  */
+  if (activeFault != FAULT_NONE) {
+    /*
+      E12 is the only fault allowed to override another already latched error.
+      Example:
+        E5 is active, then true over-temperature is detected.
+        Display must change to E12 because E12 is the highest safety priority.
+    */
+    if (rawFault == FAULT_E12_OVER_TEMP && activeFault != FAULT_E12_OVER_TEMP) {
+      activeFault = FAULT_E12_OVER_TEMP;
+      pendingFault = FAULT_NONE;
+      pendingFaultStartTime = 0;
+      operationEnabled = false;
+      allOutputsOff();
+      sendErrorToUI();
+      sendHeartbeatAckToUI();
+      return;
+    }
+
+    operationEnabled = false;
+    pendingFault = FAULT_NONE;
+    pendingFaultStartTime = 0;
+    allOutputsOff();
+
+    if (!uiRequestedOnState && startupFaultValidationReady() && rawFault == FAULT_NONE) {
+      clearActiveFault();
+      sendHeartbeatAckToUI();
+    }
+
+    return;
+  }
+
+  /*
+    No fault currently detected.
+  */
+  if (rawFault == FAULT_NONE) {
+    pendingFault = FAULT_NONE;
+    pendingFaultStartTime = 0;
+    return;
+  }
+
+  /*
+    Safety action:
+      As soon as any raw fault is detected, turn OFF all dangerous outputs.
+      Do not wait for the confirmation delay for safety outputs.
+  */
+  allOutputsOff();
+
+  /*
+    Start pending timer when a new raw fault is detected.
+  */
+  if (pendingFault != rawFault) {
+    pendingFault = rawFault;
+    pendingFaultStartTime = now;
+    return;
+  }
+
+  /*
+    Confirm the error after the required delay.
+  */
+  unsigned long requiredDelay = getFaultActivationDelay(rawFault);
+
+  if ((now - pendingFaultStartTime) >= requiredDelay) {
+    /*
+      Error is confirmed and latched.
+      It will not clear automatically while the UI/system is still in ON/error.
+      It may clear only after the user manually goes OFF and the OFF-state
+      physical validation sees rawFault == FAULT_NONE.
+    */
+    activeFault = rawFault;
+    pendingFault = FAULT_NONE;
+    pendingFaultStartTime = 0;
+
+    operationEnabled = false;
+    allOutputsOff();
+
+    sendErrorToUI();
+  }
+}
+
+
+// ======================================================
+// COMMUNICATION WATCHDOG
+// ======================================================
+
+void checkCommunicationWatchdog() {
+#if REQUIRE_UI_HEARTBEAT
+  /*
+    Power Controller-side E11 rule:
+
+      UI must send CMD_HEARTBEAT at least once every 10 seconds.
+      If the Power Controller receives no heartbeat or valid UI command for
+      10 seconds straight, E11 communication fault is triggered.
+
+    This is safe for long OFF periods because the UI keeps sending heartbeat
+    even while both boards are OFF.
+  */
+  if ((millis() - lastHeartbeatTime) > COMM_TIMEOUT_MS) {
+    communicationFault = true;
+    operationEnabled = false;
+
+    /*
+      Specification:
+        If UI communication fails, contactor must be removed.
+    */
+    allOutputsOff();
+  }
+#else
+  communicationFault = false;
+#endif
+}
+
+
+// ======================================================
+// ICSC RECEIVE CALLBACKS
+// ======================================================
+
+void onHeartbeat(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station == UI_ADDRESS) {
+    /*
+      UI is heartbeat master.
+      Receiving this packet proves the UI is alive.
+      Reply immediately with CMD_HEARTBEAT_ACK carrying PC status payload.
+    */
+    lastHeartbeatTime = millis();
+    communicationFault = false;
+
+    sendHeartbeatAckToUI();
+  }
+}
+
+void onHeartbeatAckFromUI(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station == UI_ADDRESS) {
+    /*
+      UI replied to the Power Controller heartbeat.
+      This also proves UI communication is alive.
+    */
+    lastHeartbeatTime = millis();
+    communicationFault = false;
+  }
+}
+
+void onSetOperationModeCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  if (len < 1) {
+    return;
+  }
+
+  /*
+    Payload:
+      0 = Session mode
+      1 = Standby mode
+  */
+
+  if (data[0] == 0) {
+    setOperationMode(MODE_SESSION);
+  } else if (data[0] == 1) {
+    setOperationMode(MODE_STANDBY);
+  }
+
+  sendHeartbeatAckToUI();
+}
+
+void onPowerOnCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  lastHeartbeatTime = millis();
+  communicationFault = false;
+
+  /*
+    Before accepting ON, validate any stored OFF-state fault.
+    This lets a fault disappear after it is physically fixed while the UI is OFF.
+  */
+  validateAndClearFixedFaultWhileOff();
+
+  /*
+    The UI pressed S6/ON. Keep this true even if an error prevents normal
+    operation, so errors displayed after an ON request can force cabin light ON.
+  */
+  uiRequestedOnState = true;
+
+  if (!startupFaultValidationReady()) {
+    operationEnabled = false;
+    allOutputsOff();
+    sendPowerOnAckToUI(false);
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  if (!generatorChainReadyForOperation()) {
+    operationEnabled = false;
+    allOutputsOff();
+    sendPowerOnAckToUI(false);
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  FaultCode rawFaultBeforeOn = detectRawFault();
+
+  if (rawFaultBeforeOn != FAULT_NONE) {
+    activeFault = rawFaultBeforeOn;
+    pendingFault = FAULT_NONE;
+    pendingFaultStartTime = 0;
+
+    operationEnabled = false;
+    allOutputsOff();
+
+    sendPowerOnAckToUI(false);
+    sendErrorToUI();
+    sendHeartbeatAckToUI();
+    return;
+  }
+
+  if (activeFault == FAULT_NONE && pendingFault == FAULT_NONE && !communicationFault) {
+    operationEnabled = true;
+    setOperationMode(MODE_SESSION);
+
+    // Reset operation timers.
+    waterBelowProbe3TimerRunning = false;
+    fillToProbe2TimerRunning = false;
+
+    sendPowerOnAckToUI(true);
+    sendHeartbeatAckToUI();
+  } else {
+    operationEnabled = false;
+    allOutputsOff();
+    sendPowerOnAckToUI(false);
+    sendHeartbeatAckToUI();
+  }
+}
+
+void onPowerOffCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  operationEnabled = false;
+  uiRequestedOnState = false;
+  stopAutoDrainSequence();
+  allOutputsOff();
+
+  /*
+    Manual error reset from UI:
+      The user held S6 for 2 seconds and requested OFF state.
+
+    Important updated rule:
+      Do NOT blindly clear activeFault here. OFF state is now the validation
+      state. The Power Controller keeps checking the physical inputs while OFF.
+      If the fault is fixed, updateFaultState() / validateAndClearFixedFaultWhileOff()
+      clears it and sends error=0. If the fault is still present, the stored
+      error remains and the next ON request is rejected.
+  */
+  pendingFault = FAULT_NONE;
+  pendingFaultStartTime = 0;
+
+  // Reset timers when system is turned OFF.
+  waterBelowProbe3TimerRunning = false;
+  fillToProbe2TimerRunning = false;
+
+  /*
+    OFF-state recovery scan:
+      If the user resets a slave error with S6, the Master immediately rebuilds
+      the active slave list while in OFF State. A quarantined slave remains
+      excluded and will not receive normal operation commands on the next ON.
+  */
+  startOffStateSlaveRecoveryScan();
+
+  sendStatusToUI();
+  sendHeartbeatAckToUI();
+}
+
+void onStatusRequest(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station == UI_ADDRESS) {
+    sendStatusToUI();
+  }
+}
+
+void onVersionRequest(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station == UI_ADDRESS) {
+    startDemandIlluminationStartupSequence();
+    sendVersionToUI();
+  }
+}
+
+void onDipSettingsRequest(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station == UI_ADDRESS) {
+    sendDipSettingsToUI();
+  }
+}
+
+void onDrainFillStartCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  /*
+    This command is sent by UI long-press S4.
+  */
+
+  if (activeFault != FAULT_NONE || pendingFault != FAULT_NONE) {
+    allOutputsOff();
+    return;
+  }
+
+  startAutoDrainSequence();
+}
+
+void onDrainFillStopCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+  (void)len;
+  (void)data;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  stopAutoDrainSequence();
+}
+
+void onFanControlCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  if (len < 1) {
+    return;
+  }
+
+  /*
+    Payload:
+      0 = Fan OFF
+      1 = Fan ON
+  */
+
+  if (data[0] == 0) {
+    setFan(false);
+  } else {
+    setFan(true);
+  }
+
+  sendFanStatusToUI();
+}
+
+void onScentPumpSetPointCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  if (len < 1) {
+    return;
+  }
+
+  /*
+    Payload:
+      [0] scent pump set-point, 0–20
+  */
+
+  setScentPumpSetPoint((uint8_t)data[0]);
+
+  sendScentPumpStatusToUI();
+}
+
+void onCabinLightSetPointCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  if (len < 1) {
+    return;
+  }
+
+  /*
+    Payload:
+      [0] = cabin light setpoint, 0..100
+
+    UI behavior later:
+      - DIP8 OFF: UI sends 0 or 100
+      - DIP8 ON:  UI sends 0, 5, 10, ... 100
+  */
+
+  uint8_t requestedPercent = (uint8_t)data[0];
+
+  setCabinLightLevelPercent(requestedPercent);
+
+  sendCabinLightStatusToUI();
+}
+
+
+void onDemandIlluminationCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  if (len < 1) {
+    return;
+  }
+
+  /*
+    Legacy compatibility only.
+
+    The final illumination behavior is now state-based inside the Power
+    Controller. UI commands are not allowed to override Drain OFF, Session ON,
+    Standby/OFF slow blink, or startup version ON/OFF sequence.
+
+    Payload is accepted but ignored intentionally.
+  */
+  (void)data;
+}
+
+void onUiSettingsCommand(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station != UI_ADDRESS) {
+    return;
+  }
+
+  if (len < 5) {
+    return;
+  }
+
+  /*
+    Payload:
+      [0] target temperature, 30..50/55
+      [1] session time low byte
+      [2] session time high byte
+      [3] standby time low byte
+      [4] standby time high byte
+  */
+
+  int16_t requestedTargetTempC = (uint8_t)data[0];
+
+  uint16_t requestedSessionMin =
+    (uint16_t)(uint8_t)data[1] | ((uint16_t)(uint8_t)data[2] << 8);
+
+  uint16_t requestedStandbyMin =
+    (uint16_t)(uint8_t)data[3] | ((uint16_t)(uint8_t)data[4] << 8);
+
+  loadTimeLimitsFromDipSwitches();
+  loadGeneratorSettingsFromDipSwitches();
+
+  setSessionSetPointC(requestedTargetTempC);
+  setStartTimesFromUI(requestedSessionMin, requestedStandbyMin);
+
+  sendUiSettingsAckToUI();
+}
+
+
+void onGeneratorPresence(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station == localIcscAddress) {
+    return;
+  }
+
+  GeneratorRole remoteRole = GENERATOR_ROLE_MASTER;
+  if (len >= 2 && data != NULL) {
+    remoteRole = ((uint8_t)data[1] == (uint8_t)GENERATOR_ROLE_SLAVE)
+                   ? GENERATOR_ROLE_SLAVE
+                   : GENERATOR_ROLE_MASTER;
+  }
+
+  noteGeneratorBoardSeen((uint8_t)station, remoteRole);
+
+  if (generatorRole == GENERATOR_ROLE_SLAVE && remoteRole == GENERATOR_ROLE_MASTER) {
+    applyMasterCommandToSlave(data, len);
+
+    uint8_t localError = getLocalFaultCodeForGeneratorStatus();
+
+    /*
+      Startup-fault behavior:
+        If the Slave has not yet accepted Master operation and has a fault,
+        it does not join discovery. This lets the Master ignore it after reset.
+
+      Runtime-fault behavior:
+        If the Slave was already part of operation, it replies with the error
+        so the Master can display Sx/Ex and quarantine it.
+    */
+    if (localError != 0 && !slaveAcceptedMasterOperation) {
+      return;
+    }
+
+#if ENABLE_ICSC
+    char payload[5];
+    payload[0] = (char)localIcscAddress;
+    payload[1] = (char)generatorRole;
+    payload[2] = (char)generatorSlaveNumber;
+    payload[3] = (localError == 0) ? 0 : 1;  // 0=OK, 1=error
+    payload[4] = (char)localError;
+    ICSC.send(station, CMD_GENERATOR_PRESENCE_ACK, sizeof(payload), payload);
+#endif
+  }
+}
+
+void onGeneratorPresenceAck(unsigned char station, char command, unsigned char len, char *data) {
+  (void)command;
+
+  if (station == localIcscAddress) {
+    return;
+  }
+
+  GeneratorRole remoteRole = GENERATOR_ROLE_MASTER;
+  if (len >= 2 && data != NULL) {
+    remoteRole = ((uint8_t)data[1] == (uint8_t)GENERATOR_ROLE_SLAVE)
+                   ? GENERATOR_ROLE_SLAVE
+                   : GENERATOR_ROLE_MASTER;
+  }
+
+  noteGeneratorBoardSeen((uint8_t)station, remoteRole);
+
+  if (generatorRole != GENERATOR_ROLE_MASTER || remoteRole != GENERATOR_ROLE_SLAVE) {
+    return;
+  }
+
+  uint8_t slaveId = 0;
+  if (len >= 3 && data != NULL) {
+    slaveId = (uint8_t)data[2];
+  } else if (station > POWER_CONTROLLER_ADDRESS) {
+    slaveId = (uint8_t)(station - POWER_CONTROLLER_ADDRESS);
+  }
+
+  if (slaveId < 1 || slaveId > MAX_GENERATOR_SLAVES) {
+    return;
+  }
+
+  uint8_t status = 0;
+  uint8_t errorCode = 0;
+  if (len >= 5 && data != NULL) {
+    status = (uint8_t)data[3];
+    errorCode = (uint8_t)data[4];
+    if (errorCode > 13) {
+      errorCode = 13;
+    }
+  }
+
+  lastSlaveSeenTime[slaveId] = millis();
+  currentSlaveErrorCode[slaveId] = errorCode;
+
+  if (status != 0 && errorCode != 0) {
+    // A responding active/faulted slave reports a local error.
+    latchSlaveFault(slaveId, errorCode);
+    return;
+  }
+
+  uint8_t bit = slaveMaskBit(slaveId);
+  startupDetectedSlaveMask |= bit;
+
+  if (!masterDiscoveryComplete) {
+    recomputeActiveSlaveMask();
+  } else {
+    if ((quarantinedSlaveMask & bit) == 0 && (manualDisabledSlaveMask & bit) == 0) {
+      activeSlaveMask |= bit;
+    }
+  }
+}
+
+
+// ======================================================
+// SETUP FUNCTIONS
+// ======================================================
+
+void setupProbeCommon() {
+  PROBE_COMMON_DDR |= (1 << PROBE_COMMON_PIN);
+
+#if PROBE_COMMON_ACTIVE_HIGH
+  PROBE_COMMON_PORT |= (1 << PROBE_COMMON_PIN);
+#else
+  PROBE_COMMON_PORT &= ~(1 << PROBE_COMMON_PIN);
+#endif
+}
+
+void setupInputs() {
+  // Probe inputs.
+  PROBE1_DDR &= ~(1 << PROBE1_PIN);
+  PROBE2_DDR &= ~(1 << PROBE2_PIN);
+  PROBE3_DDR &= ~(1 << PROBE3_PIN);
+
+  /*
+    Internal pull-ups OFF.
+    Your test jig/probe circuit provides the signal through PA6/common.
+  */
+  PROBE1_PORT &= ~(1 << PROBE1_PIN);
+  PROBE2_PORT &= ~(1 << PROBE2_PIN);
+  PROBE3_PORT &= ~(1 << PROBE3_PIN);
+
+  // TEMP_FUSE input PA4.
+  TEMP_FUSE_DDR &= ~(1 << TEMP_FUSE_PIN);
+  TEMP_FUSE_PORT &= ~(1 << TEMP_FUSE_PIN);
+
+  // DEMAND_SW input PA5. External 12 V bias network is used, so internal pull-up is OFF.
+  DEMAND_SW_DDR &= ~(1 << DEMAND_SW_PIN);
+  DEMAND_SW_PORT &= ~(1 << DEMAND_SW_PIN);
+
+  // NTC ADC pins PA0 and PA1 as input, pull-ups OFF.
+  DDRA &= ~((1 << PA0) | (1 << PA1));
+  PORTA &= ~((1 << PA0) | (1 << PA1));
+}
+
+void setupOutputs() {
+  CONTACTOR_DDR |= (1 << CONTACTOR_PIN);
+  AUTOFILL_DDR |= (1 << AUTOFILL_PIN);
+  AUTODRAIN_DDR |= (1 << AUTODRAIN_PIN);
+  SCENT_PUMP_DDR |= (1 << SCENT_PUMP_PIN);
+  FAN_DDR |= (1 << FAN_PIN);
+  CABIN_LIGHT_DDR |= (1 << CABIN_LIGHT_PIN);
+  DEMAND_ILLUMINATION_DDR |= (1 << DEMAND_ILLUMINATION_PIN);
+  LED_DDR |= (1 << LED_PIN);
+
+  setDemandIlluminationOutputRaw(false);
+  allOutputsOff();
+
+  aliveLedState = false;
+  lastAliveLedToggleTime = millis();
+  setLed(false);
+}
+
+void setupCommunication() {
+#if ENABLE_ICSC
+  ICSC.begin(localIcscAddress, ICSC_BAUD, &Serial, RS485_DE_PIN);
+
+  ICSC.registerCommand(CMD_HEARTBEAT, &onHeartbeat);
+  ICSC.registerCommand(CMD_HEARTBEAT_ACK, &onHeartbeatAckFromUI);
+  ICSC.registerCommand(CMD_POWER_ON, &onPowerOnCommand);
+  ICSC.registerCommand(CMD_POWER_OFF, &onPowerOffCommand);
+  ICSC.registerCommand(CMD_STATUS_REQUEST, &onStatusRequest);
+  ICSC.registerCommand(CMD_VERSION_REQUEST, &onVersionRequest);
+  ICSC.registerCommand(CMD_DRAIN_FILL_START, &onDrainFillStartCommand);
+  ICSC.registerCommand(CMD_DRAIN_FILL_STOP, &onDrainFillStopCommand);
+  ICSC.registerCommand(CMD_DIP_REQUEST, &onDipSettingsRequest);
+  ICSC.registerCommand(CMD_SET_OPERATION_MODE, &onSetOperationModeCommand);
+  ICSC.registerCommand(CMD_SCENT_PUMP_SETPOINT, &onScentPumpSetPointCommand);
+  ICSC.registerCommand(CMD_FAN_CONTROL, &onFanControlCommand);
+  ICSC.registerCommand(CMD_CABIN_LIGHT_SETPOINT, &onCabinLightSetPointCommand);
+  ICSC.registerCommand(CMD_DEMAND_ILLUMINATION, &onDemandIlluminationCommand);
+  ICSC.registerCommand(CMD_UI_SETTINGS, &onUiSettingsCommand);
+
+  // E13 generator-chain detection.
+  ICSC.registerCommand(CMD_GENERATOR_PRESENCE, &onGeneratorPresence);
+  ICSC.registerCommand(CMD_GENERATOR_PRESENCE_ACK, &onGeneratorPresenceAck);
+  ICSC.registerCommand(CMD_SLAVE_STATUS_REQUEST, &onSlaveStatusRequest);
+  ICSC.registerCommand(CMD_SLAVE_SERVICE_SET, &onSlaveServiceSet);
+#endif
+
+  lastHeartbeatTime = millis();
+  lastHeartbeatSendTime = 0;
+
+#if REQUIRE_UI_POWER_ON
+  operationEnabled = false;
+  uiRequestedOnState = false;
+#else
+  operationEnabled = true;
+  uiRequestedOnState = true;
+#endif
+
+  communicationFault = false;
+}
+
+// ======================================================
+// CABIN LIGHT DIMMER INTERRUPT NOTE
+// ======================================================
+
+/*
+  Timer1 / INT0 cabin-light dimming has been removed.
+
+  The cabin light now uses:
+    ISR(TIMER2_COMP_vect) -> cabinLightPhaseControlTick()
+
+  Keep only one cabin-light dimmer engine active.
+*/
+
+void setup() {
+  setupOutputs();
+  setupProbeCommon();
+  setupInputs();
+  resetProbeFilters();
+
+  setupDipSwitchPins();
+
+  loadTimeLimitsFromDipSwitches();
+  loadGeneratorSettingsFromDipSwitches();
+  loadSlaveMasksFromEEPROM();
+  resetGeneratorChainDetectionTimers();
+
+  setupCabinLightPhaseControlTimer2();
+
+  setupADC();
+  resetNtcAdcAverageFilters();
+
+  controllerStartupTime = millis();
+  generatorChainModeStartTime = controllerStartupTime;
+
+  setupCommunication();
+
+  cabinLightLevelPercent = 0;
+  cabinLightRequestedOn = false;
+  cabinLightPhaseLevelLL = 0;
+  cabinLightAlreadyFired = false;
+  cabinLightHoldForZeroCrossing = false;
+  setCabinLightOutputRaw(false);
+
+  demandSwitchStablePressed = false;
+  demandSwitchLastRawPressed = false;
+  demandSwitchLastChangeTime = millis();
+  demandSwitchPressEvent = false;
+  demandHeatBoostActive = false;
+  demandHeatBoostStartTime = 0;
+  demandIlluminationMode = DEMAND_ILLUMINATION_OFF;
+  demandIlluminationFastOverrideUntilTime = 0;
+  lastDemandIlluminationToggleTime = millis();
+  demandIlluminationStartupSequenceActive = false;
+  demandIlluminationStartupSequenceStartTime = millis();
+  startDemandIlluminationStartupSequence();
+
+  delay(300);
+}
+
+
+// ======================================================
+// NORMAL CONTACTOR / AUTOFILL LOGIC
+// ======================================================
+
+void runFillAndContactorLogic() {
+  bool probe1On = false;
+  bool probe2On = false;
+  bool probe3On = false;
+
+  readWaterProbes(&probe1On, &probe2On, &probe3On);
+
+  /*
+    AUTO FILL LOGIC:
+      Probe 2 / PC7 OFF -> Auto Fill ON
+      Probe 2 / PC7 ON  -> Auto Fill OFF
+  */
+  if (probe2On) {
+    setAutoFill(false);
+  } else {
+    setAutoFill(true);
+  }
+
+  /*
+    CONTACTOR LOGIC:
+      The contactor can turn ON only when:
+
+      1. Probe 3 / PC6 detects water.
+      2. Temperature controller requests heat.
+      3. No errors are pending/active.
+      4. System is ON.
+
+    The error/system checks are already handled in loop().
+    Here we only combine water level + temperature demand.
+  */
+  bool waterLevelSafeForContactor = probe3On;
+  bool temperatureRequestsHeat = updateTemperatureHeatDemand();
+
+  if (updateDemandHeatBoostController(waterLevelSafeForContactor)) {
+    return;
+  }
+
+  bool contactorRequested =
+    waterLevelSafeForContactor && temperatureRequestsHeat;
+
+  applyNormalContactorRequest(contactorRequested);
+}
+
+
+// ======================================================
+// MAIN LOOP
+// ======================================================
+
+void loop() {
+#if ENABLE_ICSC
+  ICSC.process();
+#endif
+
+  updateBidirectionalHeartbeat();
+
+  updateGeneratorPresenceBroadcast();
+
+  updateAliveLed();
+
+  updateDemandSwitchButton();
+  updateDemandSwitchLogic();
+  updateDemandIllumination();
+
+  updateTempFuseFilter();
+  updateNtcAdcAverageFilters();
+
+  validateAndClearFixedFaultWhileOff();
+
+  checkCommunicationWatchdog();
+
+  /*
+    Probe states are filtered inside readWaterProbes().
+    Fault, drain, fill, and contactor logic all use those stable states.
+  */
+
+  // First detect/update E1-E13.
+  updateFaultState();
+
+  // Then apply cabin light error behavior.
+  updateCabinLightErrorBehavior();
+  updateCabinLightDimmer();
+
+  if (communicationFault) {
+    allOutputsOff();
+    updateCabinLightErrorBehavior();
+    updateCabinLightDimmer();
+    return;
+  }
+
+  if (pendingFault != FAULT_NONE || activeFault != FAULT_NONE) {
+    allOutputsOff();
+    updateCabinLightErrorBehavior();
+    updateCabinLightDimmer();
+    periodicErrorSend();
+    return;
+  }
+
+  updateSessionAndStandbyCountdown();
+
+  /*
+    Auto Drain has priority over normal OFF/fill/contactor logic.
+    This prevents Auto Drain output chatter when Probe 1 is detected.
+  */
+  if (autoDrainState != AUTODRAIN_IDLE) {
+    runAutoDrainSequenceIfActive();
+    updateScentPumpController();
+    return;
+  }
+
+  if (!operationEnabled) {
+    allOutputsOff();
+    updateCabinLightErrorBehavior();
+    updateCabinLightDimmer();
+    return;
+  }
+
+  runFillAndContactorLogic();
+
+  updateScentPumpController();
+}
